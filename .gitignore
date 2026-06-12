@@ -1,0 +1,30 @@
+# Dependencies
+node_modules/
+
+# Local environment
+.env
+.env.*
+!.env.example
+
+# Logs and runtime output
+*.log
+.opencode/
+.cache/
+
+# TypeScript incremental cache
+*.tsbuildinfo
+
+# Test and temporary artifacts
+tmp_*/
+tmp_*
+temp_*/
+temp_*
+
+# npm package artifacts
+*.tgz
+
+# OS/editor files
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
