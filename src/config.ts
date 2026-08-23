@@ -1,3 +1,4 @@
+import fs from "fs/promises"
 import os from "os"
 import path from "path"
 
@@ -13,6 +14,39 @@ export interface RemoteConfig {
   remoteWorkdir: string
   mirrorRoot: string
   active: boolean
+}
+
+export interface StartupConnection {
+  name: string
+  sshCommand: string
+  root: string
+  password?: string
+  sudoPassword?: string
+}
+
+export interface TargetsConfigFile {
+  targets: StartupConnection[]
+}
+
+export const DEFAULT_CONFIG_PATH = path.join(
+  os.homedir(),
+  ".opencode",
+  "mcp-remote-code-targets.json"
+)
+
+interface ParsedArgv {
+  connections: StartupConnection[]
+  configPaths: string[]
+}
+
+interface PendingConnection {
+  name: string
+  sshHost: string
+  sshCommand: string
+  identity?: string
+  root: string
+  password?: string
+  sudoPassword?: string
 }
 
 export function parseSshCommand(cmd: string): {
@@ -205,55 +239,306 @@ export function buildRemoteConfig(
   }
 }
 
-export interface StartupConnection {
-  name: string
-  sshCommand: string
-  workdir: string
-  password?: string
-  sudoPassword?: string
+export function buildSshCommand(
+  host: string,
+  options?: { identity?: string; port?: number }
+): string {
+  const trimmed = host.trim().replace(/^ssh\s+/, "")
+  const parts = ["ssh"]
+  if (options?.identity) {
+    parts.push("-i", expandLocalPath(options.identity))
+  }
+  if (options?.port && options.port !== 22) {
+    parts.push("-p", String(options.port))
+  }
+  parts.push(trimmed)
+  return parts.join(" ")
 }
 
-export function parseStartupConnections(): StartupConnection[] {
-  const connections: StartupConnection[] = []
-  const argv = process.argv.slice(2)
+function withIdentity(sshCommand: string, identity: string): string {
+  const expanded = expandLocalPath(identity)
+  const tokens = tokenizeCommand(sshCommand)
+  if (tokens.length === 0 || tokens[0] !== "ssh") {
+    return sshCommand
+  }
+  for (let i = 1; i < tokens.length; i++) {
+    if (tokens[i] === "-i" || tokens[i].startsWith("-i")) {
+      return sshCommand
+    }
+  }
+  return `ssh -i ${expanded} ${tokens.slice(1).join(" ")}`
+}
 
-  let current: StartupConnection | null = null
+function applyHostValue(pending: PendingConnection, value: string): void {
+  const spec = parseRemoteSpec(value)
+  if (spec.root) {
+    pending.root = spec.root
+    pending.sshCommand = spec.sshCommand
+    pending.sshHost = ""
+    return
+  }
+  if (value.trim().startsWith("ssh ") || value.trim() === "ssh") {
+    pending.sshCommand = spec.sshCommand
+    pending.sshHost = ""
+    return
+  }
+  pending.sshHost = value.trim()
+  pending.sshCommand = ""
+}
+
+function finalizePendingConnection(pending: PendingConnection): StartupConnection {
+  let sshCommand = pending.sshCommand
+  if (!sshCommand) {
+    sshCommand = pending.sshHost
+      ? buildSshCommand(pending.sshHost, { identity: pending.identity })
+      : ""
+  } else if (pending.identity) {
+    sshCommand = withIdentity(sshCommand, pending.identity)
+  }
+
+  return {
+    name: pending.name,
+    sshCommand,
+    root: pending.root,
+    ...(pending.password ? { password: pending.password } : {}),
+    ...(pending.sudoPassword ? { sudoPassword: pending.sudoPassword } : {}),
+  }
+}
+
+export function parseRemoteSpec(value: string): { sshCommand: string; root: string } {
+  const trimmed = value.trim()
+  if (!trimmed) {
+    return { sshCommand: "", root: "" }
+  }
+
+  const pathSep = trimmed.lastIndexOf(":/")
+  if (pathSep !== -1) {
+    const hostPart = trimmed.slice(0, pathSep).trim()
+    const root = trimmed.slice(pathSep + 1)
+    if (hostPart && root.startsWith("/")) {
+      const sshCommand = hostPart.startsWith("ssh ") || hostPart === "ssh" ? hostPart : `ssh ${hostPart}`
+      return { sshCommand, root }
+    }
+  }
+
+  const sshCommand =
+    trimmed.startsWith("ssh ") || trimmed === "ssh"
+      ? trimmed
+      : trimmed.includes("@")
+        ? `ssh ${trimmed}`
+        : trimmed
+  return { sshCommand, root: "" }
+}
+
+function normalizeTargetEntry(raw: Record<string, unknown>, index: number): StartupConnection {
+  const name = typeof raw.name === "string" && raw.name.trim() ? raw.name.trim() : `target${index + 1}`
+  const key =
+    (typeof raw.key === "string" && raw.key) ||
+    (typeof raw.identity === "string" && raw.identity) ||
+    undefined
+  let sshCommand =
+    (typeof raw.ssh === "string" && raw.ssh) ||
+    (typeof raw.sshCommand === "string" && raw.sshCommand) ||
+    ""
+  let root =
+    (typeof raw.path === "string" && raw.path) ||
+    (typeof raw.root === "string" && raw.root) ||
+    (typeof raw.workdir === "string" && raw.workdir) ||
+    ""
+
+  if (sshCommand) {
+    const spec = parseRemoteSpec(sshCommand)
+    sshCommand = spec.sshCommand
+    if (!root) root = spec.root
+  } else {
+    const host = typeof raw.host === "string" ? raw.host : ""
+    const user = typeof raw.user === "string" ? raw.user : ""
+    const sshHost = host.includes("@") ? host : user && host ? `${user}@${host}` : host
+    if (sshHost) {
+      sshCommand = buildSshCommand(sshHost, { identity: key })
+    }
+  }
+
+  if (key && sshCommand && !sshCommand.includes("-i ")) {
+    sshCommand = withIdentity(sshCommand, key)
+  }
+  const password = typeof raw.password === "string" ? raw.password : undefined
+  const sudoPassword =
+    (typeof raw.sudoPassword === "string" && raw.sudoPassword) ||
+    (typeof raw.sudo_password === "string" && raw.sudo_password) ||
+    undefined
+
+  return { name, sshCommand, root, password, sudoPassword }
+}
+
+export async function loadTargetsConfigFile(configPath: string): Promise<StartupConnection[]> {
+  const data = (await fs.readFile(configPath, "utf-8")).replace(/^\uFEFF/, "")
+  return parseTargetsJson(JSON.parse(data), `Config file ${configPath}`)
+}
+
+export function parseTargetsJson(parsed: unknown, label = "Targets config"): StartupConnection[] {
+  const entries = Array.isArray(parsed)
+    ? parsed
+    : Array.isArray((parsed as TargetsConfigFile).targets)
+      ? (parsed as TargetsConfigFile).targets
+      : null
+
+  if (!entries) {
+    throw new Error(`${label} must contain a targets array`)
+  }
+
+  return entries.map((entry, index) =>
+    normalizeTargetEntry(entry as unknown as Record<string, unknown>, index)
+  )
+}
+
+export function loadTargetsFromEnv(): StartupConnection[] | null {
+  const raw = process.env.MCP_REMOTE_CODE_TARGETS?.trim()
+  if (!raw) return null
+  return parseTargetsJson(JSON.parse(raw), "MCP_REMOTE_CODE_TARGETS")
+}
+
+export function parseStartupConnections(argv: string[] = process.argv.slice(2)): ParsedArgv {
+  const connections: StartupConnection[] = []
+  const configPaths: string[] = []
+  let current: PendingConnection | null = null
 
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i]
 
-    if (arg === "--remote" || arg === "--connect") {
-      if (current) connections.push(current)
+    if (arg === "-h" || arg === "--help" || arg === "-v" || arg === "--version") {
+      continue
+    }
+
+    if (arg === "--config" || arg === "-c") {
+      configPaths.push(argv[++i])
+      continue
+    }
+
+    if (arg === "--remote" || arg === "--connect" || arg === "--ssh") {
+      if (current) connections.push(finalizePendingConnection(current))
       current = {
-        name: "default",
-        sshCommand: argv[++i],
-        workdir: "",
+        name: `target${connections.length + 1}`,
+        sshHost: "",
+        sshCommand: "",
+        root: "",
       }
-    } else if (current) {
-      if (arg === "--workdir" || arg === "-w") {
-        current.workdir = argv[++i]
-      } else if (arg === "--name" || arg === "-n") {
-        current.name = argv[++i]
-      } else if (arg === "--password" || arg === "-p") {
-        current.password = argv[++i]
-      } else if (arg === "--sudo-password") {
-        current.sudoPassword = argv[++i]
-      }
+      applyHostValue(current, argv[++i])
+      continue
+    }
+
+    if (!current) continue
+
+    if (arg === "--key" || arg === "-i" || arg === "--identity") {
+      current.identity = argv[++i]
+    } else if (arg === "--path" || arg === "--root" || arg === "--workdir" || arg === "-w") {
+      current.root = argv[++i]
+    } else if (arg === "--name" || arg === "-n") {
+      current.name = argv[++i]
+    } else if (arg === "--password") {
+      current.password = argv[++i]
+    } else if (arg === "--sudo-password") {
+      current.sudoPassword = argv[++i]
     }
   }
 
-  if (current) connections.push(current)
+  if (current) connections.push(finalizePendingConnection(current))
 
-  // Fallback to environment variables for backward compatibility
-  if (connections.length === 0 && process.env.REMOTE_SSH) {
-    connections.push({
-      name: process.env.REMOTE_NAME || "default",
-      sshCommand: process.env.REMOTE_SSH,
-      workdir: process.env.REMOTE_WORKDIR || "",
-      password: process.env.REMOTE_PASSWORD,
-      sudoPassword: process.env.REMOTE_SUDO_PASSWORD,
-    })
+  if (connections.length === 0 && configPaths.length === 0 && process.env.REMOTE_SSH) {
+    const spec = parseRemoteSpec(process.env.REMOTE_SSH)
+    connections.push(
+      finalizePendingConnection({
+        name: process.env.REMOTE_NAME || "default",
+        sshHost: "",
+        sshCommand: spec.sshCommand,
+        identity: process.env.REMOTE_KEY || process.env.REMOTE_IDENTITY,
+        root:
+          process.env.REMOTE_ROOT ||
+          process.env.REMOTE_WORKDIR ||
+          process.env.REMOTE_PATH ||
+          spec.root ||
+          "",
+        password: process.env.REMOTE_PASSWORD,
+        sudoPassword: process.env.REMOTE_SUDO_PASSWORD,
+      })
+    )
+  }
+
+  return { connections, configPaths }
+}
+
+export async function resolveStartupConnections(
+  argv: string[] = process.argv.slice(2)
+): Promise<StartupConnection[]> {
+  const { connections, configPaths } = parseStartupConnections(argv)
+  const resolved = [...connections]
+
+  if (configPaths.length > 0) {
+    for (const configPath of configPaths) {
+      resolved.push(...(await loadTargetsConfigFile(configPath)))
+    }
+    return validateStartupConnections(resolved)
+  }
+
+  if (resolved.length > 0) {
+    return validateStartupConnections(resolved)
+  }
+
+  const fromEnv = loadTargetsFromEnv()
+  if (fromEnv) {
+    return validateStartupConnections(fromEnv)
+  }
+
+  try {
+    resolved.push(...(await loadTargetsConfigFile(DEFAULT_CONFIG_PATH)))
+    return validateStartupConnections(resolved)
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code
+    if (code === "ENOENT") {
+      throw new Error(
+        `No startup targets found. Set MCP_REMOTE_CODE_TARGETS in mcp.json, pass --ssh/--key/--path, use --config, or create ${DEFAULT_CONFIG_PATH}`
+      )
+    }
+    throw err
+  }
+}
+
+export function validateStartupConnections(connections: StartupConnection[]): StartupConnection[] {
+  if (connections.length === 0) {
+    throw new Error("At least one remote target is required.")
+  }
+
+  const names = new Set<string>()
+  for (const connection of connections) {
+    if (!connection.sshCommand) {
+      throw new Error(`Target "${connection.name}" is missing an SSH command.`)
+    }
+    if (!connection.root) {
+      throw new Error(`Target "${connection.name}" is missing a root directory.`)
+    }
+    if (names.has(connection.name)) {
+      throw new Error(`Duplicate target name "${connection.name}".`)
+    }
+    names.add(connection.name)
   }
 
   return connections
+}
+
+export function parseStartupConnection(argv: string[] = process.argv.slice(2)): StartupConnection | null {
+  const { connections } = parseStartupConnections(argv)
+  return connections[0] ?? null
+}
+
+export function validateStartupConnection(connection: StartupConnection | null): StartupConnection {
+  if (!connection) {
+    throw new Error("Missing startup connection. Provide --ssh and --path (or REMOTE_SSH and REMOTE_ROOT).")
+  }
+  if (!connection.sshCommand) {
+    throw new Error("Missing SSH command. Provide --ssh or REMOTE_SSH.")
+  }
+  if (!connection.root) {
+    throw new Error("Missing remote root. Provide --path (or --root / REMOTE_ROOT / REMOTE_PATH).")
+  }
+  return connection
 }

@@ -1,3 +1,3 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { ConnectionManager } from "../connection-manager.js";
-export declare function createRemoteAddConfigTool(server: McpServer, connectionManager: ConnectionManager): void;
+export declare function createRemoteStatTool(server: McpServer, connectionManager: ConnectionManager): void;

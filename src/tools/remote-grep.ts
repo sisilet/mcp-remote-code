@@ -1,6 +1,8 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js"
 import { z } from "zod"
 import type { ConnectionManager } from "../connection-manager.js"
+import { quoteShell } from "../shell-quote.js"
+import { jailRemoteDir, requireConnection, targetSchema, textResult } from "../tool-utils.js"
 
 interface RgMatch {
   type: "match"
@@ -35,33 +37,28 @@ export function createRemoteGrepTool(
   server.registerTool(
     "remote_grep",
     {
-      description: `Search file contents using grep/ripgrep on a remote machine.`,
+      description: `Search file contents using grep/ripgrep on the remote machine within the configured root.`,
       inputSchema: {
-        machine: z.string().optional().describe("Name of the remote machine. If omitted and only one machine is connected, uses that machine."),
+        target: targetSchema,
         pattern: z.string().describe("The regex pattern to search for in file contents"),
-        path: z.string().optional().describe("The directory to search in on the remote machine. Defaults to the remote working directory."),
+        path: z.string().optional().describe("The directory to search in on the remote machine. Defaults to the configured root."),
         include: z.string().optional().describe("File pattern to include in the search (e.g. '*.js', '*.{ts,tsx}')"),
       },
     },
-    async ({ machine, pattern, path: searchDir, include }) => {
-      const conn = connectionManager.get(machine)
-      if (!conn) {
-        return {
-          content: [
-            {
-              type: "text" as const,
-              text: machine
-                ? `Connection "${machine}" not found. Use remote_list_machines to see available connections.`
-                : "No remote machines connected. Use remote_connect to connect, or specify a machine name.",
-            },
-          ],
-        }
+    async ({ target, pattern, path: searchDir, include }) => {
+      const connOrError = requireConnection(connectionManager, target)
+      if ("errorText" in connOrError) {
+        return textResult(connOrError.errorText)
       }
+      const conn = connOrError
 
-      const actualDir = searchDir || conn.config.remoteWorkdir
+      const dirResult = jailRemoteDir(conn, searchDir)
+      if ("errorText" in dirResult) {
+        return textResult(dirResult.errorText)
+      }
+      const actualDir = dirResult.path
       const limit = 100
 
-      // Try ripgrep with JSON output and reverse-time sorting first
       let cmd: string
       const escapedPattern = pattern.replace(/'/g, "'\"'\"'")
       if (include) {
@@ -73,7 +70,6 @@ export function createRemoteGrepTool(
 
       let result = await conn.sshPool.exec(cmd, { timeout: 30_000 })
 
-      // Fallback to grep if rg not available or produced no output
       if (!result.stdout.trim()) {
         if (include) {
           const glob = include.replace(/'/g, "'\"'\"'")
@@ -82,15 +78,15 @@ export function createRemoteGrepTool(
           cmd = `cd ${quoteShell(actualDir)} && grep -Ern -- '${escapedPattern}' . 2>/dev/null`
         }
         result = await conn.sshPool.exec(cmd, { timeout: 30_000 })
-        return parseGrepOutput(result.stdout, actualDir, pattern, limit, conn.name)
+        return parseGrepOutput(result.stdout, actualDir, pattern, limit)
       }
 
-      return parseRgJsonOutput(result.stdout, actualDir, pattern, limit, conn.name)
+      return parseRgJsonOutput(result.stdout, actualDir, pattern, limit)
     }
   )
 }
 
-function parseRgJsonOutput(stdout: string, searchDir: string, pattern: string, limit: number, machine: string) {
+function parseRgJsonOutput(stdout: string, searchDir: string, pattern: string, limit: number) {
   const lines = stdout.split("\n").filter(Boolean)
   const matches: Array<{ path: string; line: number; text: string }> = []
 
@@ -112,10 +108,10 @@ function parseRgJsonOutput(stdout: string, searchDir: string, pattern: string, l
     }
   }
 
-  return formatGrepResult(matches, pattern, limit, machine)
+  return formatGrepResult(matches, pattern, limit)
 }
 
-function parseGrepOutput(stdout: string, searchDir: string, pattern: string, limit: number, machine: string) {
+function parseGrepOutput(stdout: string, searchDir: string, pattern: string, limit: number) {
   const lines = stdout.split("\n").filter(Boolean)
   const matches: Array<{ path: string; line: number; text: string }> = []
 
@@ -136,24 +132,16 @@ function parseGrepOutput(stdout: string, searchDir: string, pattern: string, lim
     matches.push({ path: fullPath, line: lineNum, text })
   }
 
-  return formatGrepResult(matches, pattern, limit, machine)
+  return formatGrepResult(matches, pattern, limit)
 }
 
 function formatGrepResult(
   matches: Array<{ path: string; line: number; text: string }>,
   pattern: string,
-  limit: number,
-  machine: string
+  limit: number
 ) {
   if (matches.length === 0) {
-    return {
-      content: [
-        {
-          type: "text" as const,
-          text: `[${machine}] Pattern: ${pattern}\n\nNo files found on remote`,
-        },
-      ],
-    }
+    return textResult(`Pattern: ${pattern}\n\nNo files found on remote`)
   }
 
   const total = matches.length
@@ -181,14 +169,5 @@ function formatGrepResult(
     )
   }
 
-  return {
-    content: [
-      {
-        type: "text" as const,
-        text: `[${machine}] ${pattern}\n\n${output.join("\n")}`,
-      },
-    ],
-  }
+  return textResult(`${pattern}\n\n${output.join("\n")}`)
 }
-
-import { quoteShell } from "../shell-quote.js"

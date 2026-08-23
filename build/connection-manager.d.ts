@@ -3,14 +3,6 @@ import { ManifestManager } from "./manifest.js";
 import { PathMapper } from "./path-mapper.js";
 import { type SSHPool } from "./ssh-pool.js";
 import { SyncEngine } from "./sync-engine.js";
-export interface MachineConfig {
-    name: string;
-    sshCommand: string;
-    workdir: string;
-    password?: string;
-    sudoPassword?: string;
-    description?: string;
-}
 export interface Connection {
     name: string;
     config: RemoteConfig;
@@ -33,23 +25,19 @@ export interface ConnectionInfo {
 }
 export declare class ConnectionManager {
     private connections;
-    private configs;
-    private configFilePath;
-    private readyPromise;
-    constructor();
-    private loadConfigs;
-    ready(): Promise<void>;
-    private saveConfigs;
-    addConfig(config: MachineConfig): Promise<void>;
-    removeConfig(name: string): Promise<void>;
-    getConfig(name: string): MachineConfig | undefined;
-    listConfigs(): Array<MachineConfig & {
-        connected: boolean;
-    }>;
-    connectFromConfig(name: string): Promise<ConnectionInfo>;
-    connectWithParams(name: string, sshCommand: string, workdir: string, password?: string, sudoPassword?: string): Promise<ConnectionInfo>;
-    disconnect(name: string): Promise<void>;
-    get(name?: string): Connection | undefined;
+    connect(name: string, sshCommand: string, root: string, password?: string, sudoPassword?: string): Promise<ConnectionInfo>;
+    connectAll(startups: Array<{
+        name: string;
+        sshCommand: string;
+        root: string;
+        password?: string;
+        sudoPassword?: string;
+    }>): Promise<ConnectionInfo[]>;
+    get(target?: string): Connection | undefined;
     list(): ConnectionInfo[];
-    closeAll(): Promise<void>;
+    targetNames(): string[];
+    /** Test-only: inject a prebuilt connection without SSH handshake. */
+    setConnectionForTest(connection: Connection): void;
+    close(): Promise<void>;
+    private toInfo;
 }

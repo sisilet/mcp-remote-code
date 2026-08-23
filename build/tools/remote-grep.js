@@ -1,30 +1,27 @@
 import { z } from "zod";
+import { quoteShell } from "../shell-quote.js";
+import { jailRemoteDir, requireConnection, targetSchema, textResult } from "../tool-utils.js";
 export function createRemoteGrepTool(server, connectionManager) {
     server.registerTool("remote_grep", {
-        description: `Search file contents using grep/ripgrep on a remote machine.`,
+        description: `Search file contents using grep/ripgrep on the remote machine within the configured root.`,
         inputSchema: {
-            machine: z.string().optional().describe("Name of the remote machine. If omitted and only one machine is connected, uses that machine."),
+            target: targetSchema,
             pattern: z.string().describe("The regex pattern to search for in file contents"),
-            path: z.string().optional().describe("The directory to search in on the remote machine. Defaults to the remote working directory."),
+            path: z.string().optional().describe("The directory to search in on the remote machine. Defaults to the configured root."),
             include: z.string().optional().describe("File pattern to include in the search (e.g. '*.js', '*.{ts,tsx}')"),
         },
-    }, async ({ machine, pattern, path: searchDir, include }) => {
-        const conn = connectionManager.get(machine);
-        if (!conn) {
-            return {
-                content: [
-                    {
-                        type: "text",
-                        text: machine
-                            ? `Connection "${machine}" not found. Use remote_list_machines to see available connections.`
-                            : "No remote machines connected. Use remote_connect to connect, or specify a machine name.",
-                    },
-                ],
-            };
+    }, async ({ target, pattern, path: searchDir, include }) => {
+        const connOrError = requireConnection(connectionManager, target);
+        if ("errorText" in connOrError) {
+            return textResult(connOrError.errorText);
         }
-        const actualDir = searchDir || conn.config.remoteWorkdir;
+        const conn = connOrError;
+        const dirResult = jailRemoteDir(conn, searchDir);
+        if ("errorText" in dirResult) {
+            return textResult(dirResult.errorText);
+        }
+        const actualDir = dirResult.path;
         const limit = 100;
-        // Try ripgrep with JSON output and reverse-time sorting first
         let cmd;
         const escapedPattern = pattern.replace(/'/g, "'\"'\"'");
         if (include) {
@@ -35,7 +32,6 @@ export function createRemoteGrepTool(server, connectionManager) {
             cmd = `cd ${quoteShell(actualDir)} && rg --json --sortr=modified -n -- '${escapedPattern}' 2>/dev/null`;
         }
         let result = await conn.sshPool.exec(cmd, { timeout: 30_000 });
-        // Fallback to grep if rg not available or produced no output
         if (!result.stdout.trim()) {
             if (include) {
                 const glob = include.replace(/'/g, "'\"'\"'");
@@ -45,12 +41,12 @@ export function createRemoteGrepTool(server, connectionManager) {
                 cmd = `cd ${quoteShell(actualDir)} && grep -Ern -- '${escapedPattern}' . 2>/dev/null`;
             }
             result = await conn.sshPool.exec(cmd, { timeout: 30_000 });
-            return parseGrepOutput(result.stdout, actualDir, pattern, limit, conn.name);
+            return parseGrepOutput(result.stdout, actualDir, pattern, limit);
         }
-        return parseRgJsonOutput(result.stdout, actualDir, pattern, limit, conn.name);
+        return parseRgJsonOutput(result.stdout, actualDir, pattern, limit);
     });
 }
-function parseRgJsonOutput(stdout, searchDir, pattern, limit, machine) {
+function parseRgJsonOutput(stdout, searchDir, pattern, limit) {
     const lines = stdout.split("\n").filter(Boolean);
     const matches = [];
     for (const line of lines) {
@@ -71,9 +67,9 @@ function parseRgJsonOutput(stdout, searchDir, pattern, limit, machine) {
             // ignore malformed JSON lines
         }
     }
-    return formatGrepResult(matches, pattern, limit, machine);
+    return formatGrepResult(matches, pattern, limit);
 }
-function parseGrepOutput(stdout, searchDir, pattern, limit, machine) {
+function parseGrepOutput(stdout, searchDir, pattern, limit) {
     const lines = stdout.split("\n").filter(Boolean);
     const matches = [];
     for (const line of lines) {
@@ -93,18 +89,11 @@ function parseGrepOutput(stdout, searchDir, pattern, limit, machine) {
         const fullPath = rawPath.startsWith("/") ? rawPath : searchDir + "/" + rawPath;
         matches.push({ path: fullPath, line: lineNum, text });
     }
-    return formatGrepResult(matches, pattern, limit, machine);
+    return formatGrepResult(matches, pattern, limit);
 }
-function formatGrepResult(matches, pattern, limit, machine) {
+function formatGrepResult(matches, pattern, limit) {
     if (matches.length === 0) {
-        return {
-            content: [
-                {
-                    type: "text",
-                    text: `[${machine}] Pattern: ${pattern}\n\nNo files found on remote`,
-                },
-            ],
-        };
+        return textResult(`Pattern: ${pattern}\n\nNo files found on remote`);
     }
     const total = matches.length;
     const truncated = total > limit;
@@ -126,14 +115,6 @@ function formatGrepResult(matches, pattern, limit, machine) {
         output.push("");
         output.push(`(Results truncated: showing ${limit} of ${total} matches (${total - limit} hidden). Consider using a more specific pattern.)`);
     }
-    return {
-        content: [
-            {
-                type: "text",
-                text: `[${machine}] ${pattern}\n\n${output.join("\n")}`,
-            },
-        ],
-    };
+    return textResult(`${pattern}\n\n${output.join("\n")}`);
 }
-import { quoteShell } from "../shell-quote.js";
 //# sourceMappingURL=remote-grep.js.map

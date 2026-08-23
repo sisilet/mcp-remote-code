@@ -1,7 +1,7 @@
 import fs from "fs/promises";
-import path from "path";
 import { z } from "zod";
 import { createTwoFilesPatch, diffLines } from "diff";
+import { jailRemotePath, requireConnection, targetSchema, textResult } from "../tool-utils.js";
 import { readFileWithBom, joinBom, splitBom } from "../bom.js";
 import { trimDiff } from "../diff-utils.js";
 // ========================================================================
@@ -391,42 +391,28 @@ function countDiffStats(oldText, newText) {
 // ========================================================================
 export function createRemoteEditTool(server, connectionManager) {
     server.registerTool("remote_edit", {
-        description: `Make precise text replacements in a remote file.`,
+        description: `Make precise text replacements in a remote file within the configured root.`,
         inputSchema: {
-            machine: z.string().optional().describe("Name of the remote machine. If omitted and only one machine is connected, uses that machine."),
-            filePath: z.string().describe("The absolute path to the file to modify on the remote machine"),
+            target: targetSchema,
+            filePath: z.string().describe("The path to the file to modify on the remote machine (absolute or relative to root)"),
             oldString: z.string().describe("The text to replace"),
             newString: z.string().describe("The text to replace it with (must be different from oldString)"),
             replaceAll: z.boolean().optional().describe("Replace all occurrences of oldString (default false)"),
         },
-    }, async ({ machine, filePath, oldString, newString, replaceAll }) => {
+    }, async ({ target, filePath, oldString, newString, replaceAll }) => {
         if (oldString === newString) {
-            return {
-                content: [
-                    {
-                        type: "text",
-                        text: "No changes to apply: oldString and newString are identical.",
-                    },
-                ],
-            };
+            return textResult("No changes to apply: oldString and newString are identical.");
         }
-        const conn = connectionManager.get(machine);
-        if (!conn) {
-            return {
-                content: [
-                    {
-                        type: "text",
-                        text: machine
-                            ? `Connection "${machine}" not found. Use remote_list_machines to see available connections.`
-                            : "No remote machines connected. Use remote_connect to connect, or specify a machine name.",
-                    },
-                ],
-            };
+        const connOrError = requireConnection(connectionManager, target);
+        if ("errorText" in connOrError) {
+            return textResult(connOrError.errorText);
         }
-        let remotePath = path.posix.normalize(filePath);
-        if (!path.posix.isAbsolute(remotePath)) {
-            remotePath = path.posix.join(conn.pathMapper.remoteRoot, remotePath);
+        const conn = connOrError;
+        const jailed = await jailRemotePath(conn, filePath);
+        if ("errorText" in jailed) {
+            return textResult(jailed.errorText);
         }
+        const remotePath = jailed.path;
         const localPath = conn.pathMapper.toLocal(remotePath);
         return withFileLock(localPath, async () => {
             await conn.syncEngine.register(remotePath);
@@ -442,35 +428,21 @@ export function createRemoteEditTool(server, connectionManager) {
             }
             catch { }
             if (!existed && oldString !== "") {
-                return {
-                    content: [
-                        {
-                            type: "text",
-                            text: `File ${remotePath} not found`,
-                        },
-                    ],
-                };
+                return textResult(`File ${remotePath} not found`);
             }
             const ending = detectLineEnding(content);
             const oldNorm = convertToLineEnding(normalizeLineEndings(oldString), ending);
             const newNorm = convertToLineEnding(normalizeLineEndings(newString), ending);
             const result = replaceContent(content, oldNorm, newNorm, replaceAll ?? false);
             const diffPreview = generateDiffPreview(remotePath, content, result);
-            console.error(`[remote_edit] [${conn.name}] ${remotePath}`);
+            console.error(`[remote_edit] ${remotePath}`);
             console.error(diffPreview.slice(0, 500));
             const next = splitBom(result);
             const desiredBom = bom || next.bom;
             await fs.writeFile(localPath, joinBom(result, desiredBom), "utf-8");
             await conn.syncEngine.pushAll();
             const stats = countDiffStats(content, result);
-            return {
-                content: [
-                    {
-                        type: "text",
-                        text: `[${conn.name}] Edit applied successfully.\nPath: ${remotePath}\nAdditions: ${stats.additions}\nDeletions: ${stats.deletions}`,
-                    },
-                ],
-            };
+            return textResult(`Edit applied successfully.\nPath: ${remotePath}\nAdditions: ${stats.additions}\nDeletions: ${stats.deletions}`);
         });
     });
 }

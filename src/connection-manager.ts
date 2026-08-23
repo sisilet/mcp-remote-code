@@ -1,6 +1,4 @@
 import fs from "fs/promises"
-import os from "os"
-import path from "path"
 import type { RemoteConfig } from "./config.js"
 import { buildRemoteConfig } from "./config.js"
 import { ManifestManager } from "./manifest.js"
@@ -8,15 +6,6 @@ import { PathMapper } from "./path-mapper.js"
 import { quoteShell } from "./shell-quote.js"
 import { createSSHPool, type SSHPool } from "./ssh-pool.js"
 import { SyncEngine } from "./sync-engine.js"
-
-export interface MachineConfig {
-  name: string
-  sshCommand: string
-  workdir: string
-  password?: string
-  sudoPassword?: string
-  description?: string
-}
 
 export interface Connection {
   name: string
@@ -42,105 +31,19 @@ export interface ConnectionInfo {
 
 export class ConnectionManager {
   private connections = new Map<string, Connection>()
-  private configs = new Map<string, MachineConfig>()
-  private configFilePath: string
-  private readyPromise: Promise<void>
 
-  constructor() {
-    this.configFilePath = path.join(os.homedir(), ".opencode", "mcp-remote-code-configs.json")
-    this.readyPromise = this.loadConfigs()
-  }
-
-  private async loadConfigs(): Promise<void> {
-    try {
-      const data = (await fs.readFile(this.configFilePath, "utf-8")).replace(/^\uFEFF/, "")
-      const parsed = JSON.parse(data)
-      const configs: MachineConfig[] = Array.isArray(parsed) ? parsed : [parsed]
-      for (const config of configs) {
-        this.configs.set(config.name, config)
-      }
-    } catch {
-      // Config file doesn't exist yet, that's fine
-    }
-  }
-
-  async ready(): Promise<void> {
-    await this.readyPromise
-  }
-
-  private async saveConfigs(): Promise<void> {
-    const configs = Array.from(this.configs.values())
-    await fs.mkdir(path.dirname(this.configFilePath), { recursive: true })
-    await fs.writeFile(this.configFilePath, JSON.stringify(configs, null, 2))
-  }
-
-  // Config management
-  async addConfig(config: MachineConfig): Promise<void> {
-    if (this.configs.has(config.name)) {
-      throw new Error(`Config "${config.name}" already exists. Remove it first or use a different name.`)
-    }
-    if (!config.workdir) {
-      throw new Error(`Workdir is required for config "${config.name}".`)
-    }
-    this.configs.set(config.name, config)
-    await this.saveConfigs()
-  }
-
-  async removeConfig(name: string): Promise<void> {
-    const config = this.configs.get(name)
-    if (!config) {
-      throw new Error(`Config "${name}" not found.`)
-    }
-    // If connected, disconnect first
-    if (this.connections.has(name)) {
-      await this.disconnect(name)
-    }
-    this.configs.delete(name)
-    await this.saveConfigs()
-  }
-
-  getConfig(name: string): MachineConfig | undefined {
-    return this.configs.get(name)
-  }
-
-  listConfigs(): Array<MachineConfig & { connected: boolean }> {
-    return Array.from(this.configs.values()).map((config) => ({
-      ...config,
-      connected: this.connections.has(config.name),
-    }))
-  }
-
-  // Connection management
-  async connectFromConfig(name: string): Promise<ConnectionInfo> {
-    const config = this.configs.get(name)
-    if (!config) {
-      throw new Error(`Config "${name}" not found. Use remote_add_config to add it first.`)
-    }
-    return this.connectWithParams(
-      config.name,
-      config.sshCommand,
-      config.workdir,
-      config.password,
-      config.sudoPassword
-    )
-  }
-
-  async connectWithParams(
+  async connect(
     name: string,
     sshCommand: string,
-    workdir: string,
+    root: string,
     password?: string,
     sudoPassword?: string
   ): Promise<ConnectionInfo> {
     if (this.connections.has(name)) {
-      throw new Error(`Connection "${name}" already exists. Use a different name or disconnect first.`)
+      throw new Error(`Target "${name}" is already connected.`)
     }
 
-    if (!workdir) {
-      throw new Error(`Workdir is required for connection "${name}".`)
-    }
-
-    const config = buildRemoteConfig(sshCommand, workdir, { password, sudoPassword })
+    const config = buildRemoteConfig(sshCommand, root, { password, sudoPassword })
     const pathMapper = new PathMapper(config)
     const manifest = new ManifestManager(pathMapper)
     await manifest.load()
@@ -148,16 +51,13 @@ export class ConnectionManager {
     const sshPool = await createSSHPool(config)
     const syncEngine = new SyncEngine(config, pathMapper, manifest, sshPool)
 
-    // Clean and recreate mirror base
     try {
       await fs.rm(pathMapper.mirrorBase, { recursive: true, force: true })
     } catch {}
     await fs.mkdir(pathMapper.mirrorBase, { recursive: true }).catch(() => {})
 
-    // Reset manifest
     ;(manifest as any).manifest = { remote_root: pathMapper.remoteRoot, files: {} }
 
-    // Probe remote environment
     let remotePlatform = "linux"
     let isGitRepo = false
     try {
@@ -166,7 +66,7 @@ export class ConnectionManager {
     } catch {}
     try {
       const gitCheck = await sshPool.exec(
-        `git -C ${quoteShell(workdir)} rev-parse --git-dir 2>/dev/null`,
+        `git -C ${quoteShell(root)} rev-parse --git-dir 2>/dev/null`,
         { timeout: 5_000 }
       )
       isGitRepo = gitCheck.exitCode === 0
@@ -183,34 +83,37 @@ export class ConnectionManager {
       isGitRepo,
     })
 
-    return {
-      name,
-      host: config.host,
-      user: config.user,
-      port: config.port,
-      workdir,
-      platform: remotePlatform,
-      isGitRepo,
-      connected: true,
-    }
+    return this.toInfo(name, config, remotePlatform, isGitRepo)
   }
 
-  async disconnect(name: string): Promise<void> {
-    const conn = this.connections.get(name)
-    if (!conn) {
-      throw new Error(`Connection "${name}" not found.`)
+  async connectAll(
+    startups: Array<{
+      name: string
+      sshCommand: string
+      root: string
+      password?: string
+      sudoPassword?: string
+    }>
+  ): Promise<ConnectionInfo[]> {
+    const infos: ConnectionInfo[] = []
+    for (const startup of startups) {
+      infos.push(
+        await this.connect(
+          startup.name,
+          startup.sshCommand,
+          startup.root,
+          startup.password,
+          startup.sudoPassword
+        )
+      )
     }
-
-    await conn.manifest.save()
-    await conn.sshPool.close()
-    this.connections.delete(name)
+    return infos
   }
 
-  get(name?: string): Connection | undefined {
-    if (name) {
-      return this.connections.get(name)
+  get(target?: string): Connection | undefined {
+    if (target) {
+      return this.connections.get(target)
     }
-    // If only one connection exists, return it as default
     if (this.connections.size === 1) {
       return this.connections.values().next().value
     }
@@ -218,23 +121,43 @@ export class ConnectionManager {
   }
 
   list(): ConnectionInfo[] {
-    return Array.from(this.connections.values()).map((conn) => ({
-      name: conn.name,
-      host: conn.config.host,
-      user: conn.config.user,
-      port: conn.config.port,
-      workdir: conn.config.remoteWorkdir,
-      platform: conn.remotePlatform,
-      isGitRepo: conn.isGitRepo,
-      connected: true,
-    }))
+    return Array.from(this.connections.values()).map((conn) =>
+      this.toInfo(conn.name, conn.config, conn.remotePlatform, conn.isGitRepo)
+    )
   }
 
-  async closeAll(): Promise<void> {
+  targetNames(): string[] {
+    return Array.from(this.connections.keys())
+  }
+
+  /** Test-only: inject a prebuilt connection without SSH handshake. */
+  setConnectionForTest(connection: Connection): void {
+    this.connections.set(connection.name, connection)
+  }
+
+  async close(): Promise<void> {
     for (const conn of this.connections.values()) {
       await conn.manifest.save()
       await conn.sshPool.close()
     }
     this.connections.clear()
+  }
+
+  private toInfo(
+    name: string,
+    config: RemoteConfig,
+    platform: string,
+    isGitRepo: boolean
+  ): ConnectionInfo {
+    return {
+      name,
+      host: config.host,
+      user: config.user,
+      port: config.port,
+      workdir: config.remoteWorkdir,
+      platform,
+      isGitRepo,
+      connected: true,
+    }
   }
 }

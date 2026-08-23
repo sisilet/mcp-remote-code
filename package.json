@@ -1,7 +1,7 @@
 {
   "name": "mcp-remote-code",
-  "version": "1.2.0",
-  "description": "MCP server for remote machine control over SSH - exposes remote tools as additional capabilities alongside local tools",
+  "version": "2.1.0",
+  "description": "Stdio MCP server for remote machine control over SSH with a jailed root directory",
   "type": "module",
   "main": "build/index.js",
   "bin": {
@@ -19,20 +19,21 @@
     "build": "tsc",
     "postbuild": "node scripts/postbuild.mjs",
     "dev": "tsc --watch",
-    "lint": "tsc --noEmit"
+    "lint": "tsc --noEmit",
+    "test": "node --import tsx --test test/*.test.ts test/tools/*.test.ts",
+    "test:docker": "node --import tsx --test test/docker/*.test.ts"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.29.0",
     "diff": "^9.0.0",
-    "express": "^5.2.1",
     "ssh2": "^1.17.0",
     "zod": "^3.25.0"
   },
   "devDependencies": {
     "@types/diff": "^7.0.2",
-    "@types/express": "^5.0.6",
     "@types/node": "^20.0.0",
     "@types/ssh2": "^1.15.5",
+    "tsx": "^4.19.0",
     "typescript": "^5.4.0"
   },
   "keywords": [
@@ -40,7 +41,7 @@
     "ssh",
     "remote",
     "agent",
-    "opencode"
+    "stdio"
   ],
   "license": "MIT"
 }

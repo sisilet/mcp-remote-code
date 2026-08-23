@@ -1,6 +1,7 @@
 import fs from "fs/promises";
 import path from "path";
 import { z } from "zod";
+import { jailRemotePath, requireConnection, targetSchema, textResult } from "../tool-utils.js";
 import { readFileWithBom, joinBom } from "../bom.js";
 import { quoteShell } from "../shell-quote.js";
 function parsePatchHeader(lines, startIdx) {
@@ -392,34 +393,19 @@ function tryMatchUnified(lines, idx, oldLines) {
 // ========================================================================
 export function createRemotePatchTool(server, connectionManager) {
     server.registerTool("remote_patch", {
-        description: `Apply a patch to files on a remote machine. Supports both unified diff format and OpenCode native patch format.`,
+        description: `Apply a patch to files on the remote machine within the configured root. Supports both unified diff format and OpenCode native patch format.`,
         inputSchema: {
-            machine: z.string().optional().describe("Name of the remote machine. If omitted and only one machine is connected, uses that machine."),
+            target: targetSchema,
             patchText: z.string().describe("The full patch text that describes all changes to be made"),
         },
-    }, async ({ machine, patchText }) => {
-        const conn = connectionManager.get(machine);
-        if (!conn) {
-            return {
-                content: [
-                    {
-                        type: "text",
-                        text: machine
-                            ? `Connection "${machine}" not found. Use remote_list_machines to see available connections.`
-                            : "No remote machines connected. Use remote_connect to connect, or specify a machine name.",
-                    },
-                ],
-            };
+    }, async ({ target, patchText }) => {
+        const connOrError = requireConnection(connectionManager, target);
+        if ("errorText" in connOrError) {
+            return textResult(connOrError.errorText);
         }
+        const conn = connOrError;
         if (!patchText.trim()) {
-            return {
-                content: [
-                    {
-                        type: "text",
-                        text: "patchText is required",
-                    },
-                ],
-            };
+            return textResult("patchText is required");
         }
         const normalizedPatchText = patchText.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
         let files;
@@ -433,20 +419,21 @@ export function createRemotePatchTool(server, connectionManager) {
             files = await parseAndPrepareUnified(normalizedPatchText, conn.config.remoteWorkdir, conn.pathMapper);
         }
         if (files.length === 0) {
-            return {
-                content: [
-                    {
-                        type: "text",
-                        text: "apply_patch verification failed: no file paths found in patch",
-                    },
-                ],
-            };
+            return textResult("apply_patch verification failed: no file paths found in patch");
         }
         const involvedPaths = new Set();
         for (const f of files) {
             involvedPaths.add(f.path);
             if (f.moveFrom)
                 involvedPaths.add(f.moveFrom);
+        }
+        for (const rp of involvedPaths) {
+            if (rp === "/dev/null")
+                continue;
+            const jailed = await jailRemotePath(conn, rp, { forNewFile: true, allowMissing: true });
+            if ("errorText" in jailed) {
+                return textResult(jailed.errorText);
+            }
         }
         for (const rp of involvedPaths) {
             await conn.syncEngine.register(rp);
@@ -472,14 +459,7 @@ export function createRemotePatchTool(server, connectionManager) {
                 conn.syncEngine.manifest.remove(f.moveFrom);
             }
         }
-        return {
-            content: [
-                {
-                    type: "text",
-                    text: `[${conn.name}] Patched ${involvedPaths.size} file(s)\n\nSuccess. Updated the following files:\n${Array.from(involvedPaths).join("\n")}`,
-                },
-            ],
-        };
+        return textResult(`Patched ${involvedPaths.size} file(s)\n\nSuccess. Updated the following files:\n${Array.from(involvedPaths).join("\n")}`);
     });
 }
 async function parseAndPrepareUnified(patchText, remoteWorkdir, pathMapper) {

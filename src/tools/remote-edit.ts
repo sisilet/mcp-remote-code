@@ -1,9 +1,10 @@
-﻿import fs from "fs/promises"
+import fs from "fs/promises"
 import path from "path"
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js"
 import { z } from "zod"
 import { createTwoFilesPatch, diffLines } from "diff"
 import type { ConnectionManager } from "../connection-manager.js"
+import { jailRemotePath, requireConnection, targetSchema, textResult } from "../tool-utils.js"
 import { readFileWithBom, joinBom, splitBom } from "../bom.js"
 import { trimDiff } from "../diff-utils.js"
 
@@ -402,45 +403,31 @@ export function createRemoteEditTool(
   server.registerTool(
     "remote_edit",
     {
-      description: `Make precise text replacements in a remote file.`,
+      description: `Make precise text replacements in a remote file within the configured root.`,
       inputSchema: {
-        machine: z.string().optional().describe("Name of the remote machine. If omitted and only one machine is connected, uses that machine."),
-        filePath: z.string().describe("The absolute path to the file to modify on the remote machine"),
+        target: targetSchema,
+        filePath: z.string().describe("The path to the file to modify on the remote machine (absolute or relative to root)"),
         oldString: z.string().describe("The text to replace"),
         newString: z.string().describe("The text to replace it with (must be different from oldString)"),
         replaceAll: z.boolean().optional().describe("Replace all occurrences of oldString (default false)"),
       },
     },
-    async ({ machine, filePath, oldString, newString, replaceAll }) => {
+    async ({ target, filePath, oldString, newString, replaceAll }) => {
       if (oldString === newString) {
-        return {
-          content: [
-            {
-              type: "text" as const,
-              text: "No changes to apply: oldString and newString are identical.",
-            },
-          ],
-        }
+        return textResult("No changes to apply: oldString and newString are identical.")
       }
 
-      const conn = connectionManager.get(machine)
-      if (!conn) {
-        return {
-          content: [
-            {
-              type: "text" as const,
-              text: machine
-                ? `Connection "${machine}" not found. Use remote_list_machines to see available connections.`
-                : "No remote machines connected. Use remote_connect to connect, or specify a machine name.",
-            },
-          ],
-        }
+      const connOrError = requireConnection(connectionManager, target)
+      if ("errorText" in connOrError) {
+        return textResult(connOrError.errorText)
       }
+      const conn = connOrError
 
-      let remotePath = path.posix.normalize(filePath)
-      if (!path.posix.isAbsolute(remotePath)) {
-        remotePath = path.posix.join(conn.pathMapper.remoteRoot, remotePath)
+      const jailed = await jailRemotePath(conn, filePath)
+      if ("errorText" in jailed) {
+        return textResult(jailed.errorText)
       }
+      const remotePath = jailed.path
 
       const localPath = conn.pathMapper.toLocal(remotePath)
 
@@ -459,14 +446,7 @@ export function createRemoteEditTool(
         } catch {}
 
         if (!existed && oldString !== "") {
-          return {
-            content: [
-              {
-                type: "text" as const,
-                text: `File ${remotePath} not found`,
-              },
-            ],
-          }
+          return textResult(`File ${remotePath} not found`)
         }
 
         const ending = detectLineEnding(content)
@@ -476,7 +456,7 @@ export function createRemoteEditTool(
         const result = replaceContent(content, oldNorm, newNorm, replaceAll ?? false)
 
         const diffPreview = generateDiffPreview(remotePath, content, result)
-        console.error(`[remote_edit] [${conn.name}] ${remotePath}`)
+        console.error(`[remote_edit] ${remotePath}`)
         console.error(diffPreview.slice(0, 500))
 
         const next = splitBom(result)
@@ -486,14 +466,9 @@ export function createRemoteEditTool(
 
         const stats = countDiffStats(content, result)
 
-        return {
-          content: [
-            {
-              type: "text" as const,
-              text: `[${conn.name}] Edit applied successfully.\nPath: ${remotePath}\nAdditions: ${stats.additions}\nDeletions: ${stats.deletions}`,
-            },
-          ],
-        }
+        return textResult(
+          `Edit applied successfully.\nPath: ${remotePath}\nAdditions: ${stats.additions}\nDeletions: ${stats.deletions}`
+        )
       })
     }
   )

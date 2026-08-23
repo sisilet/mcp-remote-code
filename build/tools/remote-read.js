@@ -1,6 +1,7 @@
 import fs from "fs/promises";
 import path from "path";
 import { z } from "zod";
+import { jailRemotePath, requireConnection, targetSchema, textResult } from "../tool-utils.js";
 const DEFAULT_LIMIT = 2000;
 const MAX_BYTES = 50 * 1024;
 const MAX_LINE_LENGTH = 2000;
@@ -34,31 +35,24 @@ async function checkRemoteBinary(sshPool, remotePath) {
 }
 export function createRemoteReadTool(server, connectionManager) {
     server.registerTool("remote_read", {
-        description: `Read the contents of a file or list a directory on a remote machine.`,
+        description: `Read the contents of a file or list a directory on the remote machine within the configured root.`,
         inputSchema: {
-            machine: z.string().optional().describe("Name of the remote machine. If omitted and only one machine is connected, uses that machine."),
-            filePath: z.string().describe("The absolute path to the file or directory to read on the remote machine"),
+            target: targetSchema,
+            filePath: z.string().describe("The path to the file or directory to read on the remote machine (absolute or relative to root)"),
             offset: z.number().optional().describe("The line number to start reading from (1-indexed)"),
             limit: z.number().optional().describe("The maximum number of lines to read (defaults to 2000)"),
         },
-    }, async ({ machine, filePath, offset: offsetArg, limit: limitArg }) => {
-        const conn = connectionManager.get(machine);
-        if (!conn) {
-            return {
-                content: [
-                    {
-                        type: "text",
-                        text: machine
-                            ? `Connection "${machine}" not found. Use remote_list_machines to see available connections.`
-                            : "No remote machines connected. Use remote_connect to connect, or specify a machine name.",
-                    },
-                ],
-            };
+    }, async ({ target, filePath, offset: offsetArg, limit: limitArg }) => {
+        const connOrError = requireConnection(connectionManager, target);
+        if ("errorText" in connOrError) {
+            return textResult(connOrError.errorText);
         }
-        let remotePath = path.posix.normalize(filePath);
-        if (!path.posix.isAbsolute(remotePath)) {
-            remotePath = path.posix.join(conn.pathMapper.remoteRoot, remotePath);
+        const conn = connOrError;
+        const jailed = await jailRemotePath(conn, filePath, { allowMissing: true });
+        if ("errorText" in jailed) {
+            return textResult(jailed.errorText);
         }
+        const remotePath = jailed.path;
         const localPath = conn.pathMapper.toLocal(remotePath);
         const limit = limitArg ?? DEFAULT_LIMIT;
         const offset = (offsetArg ?? 1) - 1;

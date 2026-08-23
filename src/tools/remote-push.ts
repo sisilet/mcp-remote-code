@@ -3,13 +3,12 @@ import path from "path"
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js"
 import { z } from "zod"
 import type { ConnectionManager } from "../connection-manager.js"
+import { checkConfirmation } from "../confirmation.js"
 import { quoteShell } from "../shell-quote.js"
+import { jailRemotePath, requireConnection, targetSchema, textResult } from "../tool-utils.js"
 
 const DEFAULT_WARN_BYTES = 25 * 1024 * 1024
 const DEFAULT_WARN_FILES = 500
-const CONFIRMATION_TTL_MS = 10 * 60 * 1000
-
-const pendingConfirmations = new Map<string, number>()
 
 interface RemotePushPlan {
   localPath: string
@@ -40,73 +39,40 @@ export function createRemotePushTool(
   server.registerTool(
     "remote_push",
     {
-      description: `Upload a local file or directory to an explicitly provided absolute remote path. Large transfers return a size warning first and require force=true on a second call.`,
+      description: `Upload a local file or directory to an explicitly provided absolute remote path within the configured root. Large transfers return a size warning first and require force=true on a second call.`,
       inputSchema: {
-        machine: z.string().optional().describe("Name of the remote machine. If omitted and only one machine is connected, uses that machine."),
+        target: targetSchema,
         localPath: z.string().describe("The absolute local source file or directory path to upload."),
-        remotePath: z.string().describe("The absolute remote destination path. For files this is the target file path; for directories this is the target directory path."),
+        remotePath: z.string().describe("The remote destination path (absolute or relative to root). For files this is the target file path; for directories this is the target directory path."),
         force: z.boolean().optional().describe("Set true only after a large-transfer warning to confirm the upload."),
       },
     },
-    async ({ machine, localPath: localPathArg, remotePath: remotePathArg, force }) => {
-      const conn = connectionManager.get(machine)
-      if (!conn) {
-        return {
-          content: [
-            {
-              type: "text" as const,
-              text: machine
-                ? `Connection "${machine}" not found. Use remote_list_machines to see available connections.`
-                : "No remote machines connected. Use remote_connect to connect, or specify a machine name.",
-            },
-          ],
-        }
+    async ({ target, localPath: localPathArg, remotePath: remotePathArg, force }) => {
+      const connOrError = requireConnection(connectionManager, target)
+      if ("errorText" in connOrError) {
+        return textResult(connOrError.errorText)
       }
+      const conn = connOrError
 
       const localPath = normalizeLocalPath(localPathArg)
       if (!localPath) {
-        return {
-          content: [
-            {
-              type: "text" as const,
-              text: `remote_push localPath must be an absolute local path, got: ${localPathArg}`,
-            },
-          ],
-        }
+        return textResult(`remote_push localPath must be an absolute local path, got: ${localPathArg}`)
       }
 
-      const remotePath = normalizeRemotePath(remotePathArg)
-      if (!remotePath) {
-        return {
-          content: [
-            {
-              type: "text" as const,
-              text: `remote_push remotePath must be an absolute remote path, got: ${remotePathArg}`,
-            },
-          ],
-        }
+      const jailed = await jailRemotePath(conn, remotePathArg, { forNewFile: true, allowMissing: true })
+      if ("errorText" in jailed) {
+        return textResult(jailed.errorText)
       }
+      const remotePath = jailed.path
 
       const stat = await statLocalPath(localPath)
       if (stat.type === "missing") {
-        return {
-          content: [
-            {
-              type: "text" as const,
-              text: `Local path not found: ${localPath}`,
-            },
-          ],
-        }
+        return textResult(`Local path not found: ${localPath}`)
       }
       if (stat.type === "unsupported") {
-        return {
-          content: [
-            {
-              type: "text" as const,
-              text: `Unsupported local path type: ${localPath}. remote_push supports regular files and directories.`,
-            },
-          ],
-        }
+        return textResult(
+          `Unsupported local path type: ${localPath}. remote_push supports regular files and directories.`
+        )
       }
 
       const plan: RemotePushPlan = {
@@ -121,43 +87,33 @@ export function createRemotePushTool(
       const warnBytes = parsePositiveInt(process.env.REMOTE_PUSH_WARN_BYTES, DEFAULT_WARN_BYTES)
       const warnFiles = parsePositiveInt(process.env.REMOTE_PUSH_WARN_FILES, DEFAULT_WARN_FILES)
       const isLarge = plan.bytes > warnBytes || plan.files > warnFiles
-      const confirmationKey = buildConfirmationKey(conn.name, plan)
+      const confirmationKey = buildConfirmationKey(plan)
+      const outcome = checkConfirmation(
+        confirmationKey,
+        isLarge,
+        force,
+        () =>
+          [
+            "Push requires confirmation.",
+            "",
+            renderPlan(plan),
+            "",
+            `Warning: this transfer exceeds the large-transfer threshold (${formatBytes(warnBytes)} or ${warnFiles} files).`,
+            `Run remote_push again with the same localPath/remotePath and force=true within 10 minutes to upload it.`,
+          ].join("\n"),
+        () =>
+          [
+            "Push is preflighted but not confirmed.",
+            "",
+            renderPlan(plan),
+            "",
+            `Run remote_push again with force=true to upload it.`,
+          ].join("\n")
+      )
 
-      if (isLarge && !hasFreshConfirmation(confirmationKey)) {
-        pendingConfirmations.set(confirmationKey, Date.now() + CONFIRMATION_TTL_MS)
-        return {
-          content: [
-            {
-              type: "text" as const,
-              text: [
-                `[${conn.name}] Push requires confirmation.`,
-                "",
-                renderPlan(plan),
-                "",
-                `Warning: this transfer exceeds the large-transfer threshold (${formatBytes(warnBytes)} or ${warnFiles} files).`,
-                `Run remote_push again with the same localPath/remotePath and force=true within 10 minutes to upload it.`,
-              ].join("\n"),
-            },
-          ],
-        }
+      if (outcome.status === "pending" || outcome.status === "needs_force") {
+        return textResult(outcome.message)
       }
-      if (isLarge && !force) {
-        return {
-          content: [
-            {
-              type: "text" as const,
-              text: [
-                `[${conn.name}] Push is preflighted but not confirmed.`,
-                "",
-                renderPlan(plan),
-                "",
-                `Run remote_push again with force=true to upload it.`,
-              ].join("\n"),
-            },
-          ],
-        }
-      }
-      pendingConfirmations.delete(confirmationKey)
 
       if (plan.type === "file") {
         await pushFile(conn.sshPool, plan.localPath, plan.remotePath)
@@ -165,18 +121,7 @@ export function createRemotePushTool(
         await pushDirectory(conn.sshPool, plan.localPath, plan.remotePath)
       }
 
-      return {
-        content: [
-          {
-            type: "text" as const,
-            text: [
-              `[${conn.name}] Pushed local ${plan.type} successfully.`,
-              "",
-              renderPlan(plan),
-            ].join("\n"),
-          },
-        ],
-      }
+      return textResult(["Pushed local ${plan.type} successfully.", "", renderPlan(plan)].join("\n"))
     }
   )
 }
@@ -201,12 +146,26 @@ function isFullyQualifiedLocalAbsolute(rawPath: string): boolean {
   return /^[a-zA-Z]:[\\/]$/.test(root) || root.startsWith("\\\\")
 }
 
-function normalizeRemotePath(rawPath: string): string | undefined {
-  const remotePath = path.posix.normalize(rawPath)
-  if (!path.posix.isAbsolute(remotePath)) {
-    return undefined
-  }
-  return remotePath
+function buildConfirmationKey(plan: RemotePushPlan): string {
+  return [
+    plan.localPath,
+    plan.remotePath,
+    plan.type,
+    plan.bytes,
+    plan.files,
+    plan.directories,
+  ].join("\0")
+}
+
+function renderPlan(plan: RemotePushPlan): string {
+  return [
+    `Local source: ${plan.localPath}`,
+    `Remote destination: ${plan.remotePath}`,
+    `Type: ${plan.type}`,
+    `Size: ${formatBytes(plan.bytes)} (${plan.bytes} bytes)`,
+    `Files: ${plan.files}`,
+    plan.type === "directory" ? `Directories: ${plan.directories}` : undefined,
+  ].filter(Boolean).join("\n")
 }
 
 async function statLocalPath(localPath: string): Promise<LocalStat> {
@@ -320,39 +279,6 @@ function parsePositiveInt(value: string | undefined, fallback: number): number {
   if (!value) return fallback
   const parsed = parseInt(value, 10)
   return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback
-}
-
-function hasFreshConfirmation(key: string): boolean {
-  const expiresAt = pendingConfirmations.get(key)
-  if (!expiresAt) return false
-  if (expiresAt <= Date.now()) {
-    pendingConfirmations.delete(key)
-    return false
-  }
-  return true
-}
-
-function buildConfirmationKey(machine: string, plan: RemotePushPlan): string {
-  return [
-    machine,
-    plan.localPath,
-    plan.remotePath,
-    plan.type,
-    plan.bytes,
-    plan.files,
-    plan.directories,
-  ].join("\0")
-}
-
-function renderPlan(plan: RemotePushPlan): string {
-  return [
-    `Local source: ${plan.localPath}`,
-    `Remote destination: ${plan.remotePath}`,
-    `Type: ${plan.type}`,
-    `Size: ${formatBytes(plan.bytes)} (${plan.bytes} bytes)`,
-    `Files: ${plan.files}`,
-    plan.type === "directory" ? `Directories: ${plan.directories}` : undefined,
-  ].filter(Boolean).join("\n")
 }
 
 function formatBytes(bytes: number): string {

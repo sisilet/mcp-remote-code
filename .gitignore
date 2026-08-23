@@ -19,6 +19,7 @@ tmp_*/
 tmp_*
 temp_*/
 temp_*
+test/docker/.keys/
 
 # npm package artifacts
 *.tgz
@@ -28,3 +29,4 @@ temp_*
 Thumbs.db
 .vscode/
 .idea/
+.cursor/

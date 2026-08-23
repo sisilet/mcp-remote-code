@@ -4,6 +4,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js"
 import { z } from "zod"
 import { createTwoFilesPatch } from "diff"
 import type { ConnectionManager } from "../connection-manager.js"
+import { jailRemotePath, requireConnection, targetSchema, textResult } from "../tool-utils.js"
 import { readFileWithBom, joinBom, splitBom } from "../bom.js"
 import { trimDiff } from "../diff-utils.js"
 
@@ -14,32 +15,25 @@ export function createRemoteWriteTool(
   server.registerTool(
     "remote_write",
     {
-      description: `Write content to a file on a remote machine.`,
+      description: `Write content to a file on the remote machine within the configured root.`,
       inputSchema: {
-        machine: z.string().optional().describe("Name of the remote machine. If omitted and only one machine is connected, uses that machine."),
+        target: targetSchema,
         content: z.string().describe("The content to write to the file"),
-        filePath: z.string().describe("The absolute path to the file to write on the remote machine (must be absolute)"),
+        filePath: z.string().describe("The path to the file to write on the remote machine (absolute or relative to root)"),
       },
     },
-    async ({ machine, content, filePath }) => {
-      const conn = connectionManager.get(machine)
-      if (!conn) {
-        return {
-          content: [
-            {
-              type: "text" as const,
-              text: machine
-                ? `Connection "${machine}" not found. Use remote_list_machines to see available connections.`
-                : "No remote machines connected. Use remote_connect to connect, or specify a machine name.",
-            },
-          ],
-        }
+    async ({ target, content, filePath }) => {
+      const connOrError = requireConnection(connectionManager, target)
+      if ("errorText" in connOrError) {
+        return textResult(connOrError.errorText)
       }
+      const conn = connOrError
 
-      let remotePath = path.posix.normalize(filePath)
-      if (!path.posix.isAbsolute(remotePath)) {
-        remotePath = path.posix.join(conn.pathMapper.remoteRoot, remotePath)
+      const jailed = await jailRemotePath(conn, filePath, { forNewFile: true })
+      if ("errorText" in jailed) {
+        return textResult(jailed.errorText)
       }
+      const remotePath = jailed.path
 
       const localPath = conn.pathMapper.toLocal(remotePath)
       const existed = await fs.stat(localPath).then((s) => s.isFile(), () => false)
@@ -61,7 +55,7 @@ export function createRemoteWriteTool(
         ? generateDiffPreview(remotePath, oldContent, content)
         : `A ${remotePath}\n+ ${content.split("\n").slice(0, 10).join("\n+ ")}`
 
-      console.error(`[remote_write] [${conn.name}] ${remotePath}${existed ? " (overwrite)" : " (new)"}`)
+      console.error(`[remote_write] ${remotePath}${existed ? " (overwrite)" : " (new)"}`)
       console.error(diffPreview.slice(0, 500))
 
       await fs.mkdir(path.dirname(localPath), { recursive: true })
@@ -70,14 +64,7 @@ export function createRemoteWriteTool(
       await conn.syncEngine.register(remotePath)
       await conn.syncEngine.pushAll()
 
-      return {
-        content: [
-          {
-            type: "text" as const,
-            text: `[${conn.name}] Wrote file successfully.\nPath: ${remotePath}\nExists: ${existed}`,
-          },
-        ],
-      }
+      return textResult(`Wrote file successfully.\nPath: ${remotePath}\nExists: ${existed}`)
     }
   )
 }
