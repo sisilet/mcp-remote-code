@@ -38,13 +38,31 @@ export class SyncEngine {
     })
   }
 
-  /** Push all tracked files from local mirror to remote */
-  async pushAll(): Promise<void> {
+  /**
+   * Push only the given files from local mirror to remote.
+   *
+   * Tools must push exactly what they changed. pushAll() used to be called
+   * after every remote_write, which uploaded the mirror's copy of EVERY file
+   * tracked in the session. The mirror is only refreshed from the remote when
+   * the target file already exists locally, so writing a NEW file skipped the
+   * pull and then overwrote every earlier file with a stale copy, silently
+   * destroying any change made on the remote outside this tool (2026-09-08:
+   * two scripts lost hours of edits this way).
+   */
+  async push(remotePaths: string[]): Promise<void> {
     await this.withLock(async () => {
-      const files = this.manifest.remotePaths()
-      if (files.length === 0) return
-      await this.runSftp("push", files)
+      if (remotePaths.length === 0) return
+      await this.runSftp("push", remotePaths)
     })
+  }
+
+  /**
+   * Push all tracked files. Kept for callers that have just pulled everything
+   * and therefore hold a fresh mirror; do NOT call this after writing a single
+   * file. Prefer push([...]).
+   */
+  async pushAll(): Promise<void> {
+    await this.push(this.manifest.remotePaths())
   }
 
   /** Register a new remote file and ensure its parent directory exists locally */
@@ -79,7 +97,7 @@ export class SyncEngine {
         } else {
           // Ensure remote parent dir exists
           const remoteDir = path.posix.dirname(rp)
-          await this.sshPool.exec(`mkdir -p ${quoteShell(remoteDir)}`, { timeout: 10_000 }).catch(() => {})
+          await this.sshPool.exec(`mkdir -p ${quoteShell(remoteDir)}`, { retry: true, timeout: 10_000 }).catch(() => {})
           await sftpFastPut(sftp, localPath, rp)
         }
       }
@@ -100,17 +118,81 @@ function sftpFastGet(
   })
 }
 
-function sftpFastPut(
+const call = <T>(fn: (cb: (err: Error | undefined, result?: T) => void) => void): Promise<T> =>
+  new Promise((resolve, reject) =>
+    fn((err, result) => (err ? reject(err) : resolve(result as T)))
+  )
+
+/** Resolves rather than rejects: used where failure is tolerable. */
+const tryCall = (fn: (cb: (err?: Error) => void) => void): Promise<boolean> =>
+  new Promise((resolve) => fn((err) => resolve(!err)))
+
+/**
+ * Upload atomically: write a sibling temp file, then rename over the target
+ * (review F-12). A direct fastPut that fails partway leaves the destination
+ * truncated, which is how a good file becomes a broken one. rename(2) within
+ * the same directory is atomic on POSIX filesystems.
+ *
+ * The ordering matters, and the first version got it wrong (review F-27). It
+ * unlinked the target before the rename, and its error path deleted the temp
+ * as well, so a failed rename left neither the old file nor the new one. That
+ * is worse than the truncation F-12 set out to prevent: truncation loses the
+ * contents, this lost the file.
+ *
+ * So the target is moved aside rather than deleted, and it is only discarded
+ * once the new content holds the real name. At every instant between the
+ * first write and the last unlink, the full old contents or the full new
+ * contents exist under some name on the remote.
+ */
+export async function sftpFastPut(
   sftp: any,
   localPath: string,
   remotePath: string
 ): Promise<void> {
-  return new Promise((resolve, reject) => {
-    sftp.fastPut(localPath, remotePath, (err: Error | undefined) => {
-      if (err) reject(err)
-      else resolve()
-    })
+  const dir = remotePath.slice(0, remotePath.lastIndexOf("/") + 1)
+  const base = remotePath.slice(remotePath.lastIndexOf("/") + 1)
+  const stamp = `${process.pid}-${Date.now()}`
+  const tempPath = `${dir}.${base}.mcp-tmp-${stamp}`
+  const backupPath = `${dir}.${base}.mcp-bak-${stamp}`
+
+  // Mode of the file being replaced, so the replacement does not silently
+  // become whatever the server's umask produces.
+  const previousMode = await new Promise<number | undefined>((resolve) => {
+    sftp.stat(remotePath, (err: Error | undefined, stats: any) =>
+      resolve(err ? undefined : (stats?.mode as number | undefined))
+    )
   })
+
+  await call<void>((cb) => sftp.fastPut(localPath, tempPath, cb))
+
+  if (previousMode !== undefined && typeof sftp.chmod === "function") {
+    await tryCall((cb) => sftp.chmod(tempPath, previousMode & 0o7777, cb))
+  }
+
+  // Move the existing file aside. Absent target: nothing to preserve.
+  const backedUp = await tryCall((cb) => sftp.rename(remotePath, backupPath, cb))
+
+  try {
+    await call<void>((cb) => sftp.rename(tempPath, remotePath, cb))
+  } catch (err) {
+    // Put the original back before surfacing the failure. The temp is only
+    // removed after the original is safe.
+    if (backedUp) {
+      const restored = await tryCall((cb) => sftp.rename(backupPath, remotePath, cb))
+      if (!restored) {
+        throw new Error(
+          `Upload of ${remotePath} failed and the original could not be restored. ` +
+          `The previous contents are at ${backupPath}. Original error: ${(err as Error).message}`
+        )
+      }
+    }
+    await tryCall((cb) => sftp.unlink(tempPath, cb))
+    throw err
+  }
+
+  if (backedUp) {
+    await tryCall((cb) => sftp.unlink(backupPath, cb))
+  }
 }
 
 import { quoteShell } from "./shell-quote.js"

@@ -23,7 +23,7 @@ export function createRemoteWriteTool(
       },
     },
     async ({ target, content, filePath }) => {
-      const connOrError = requireConnection(connectionManager, target)
+      const connOrError = await requireConnection(connectionManager, target)
       if ("errorText" in connOrError) {
         return textResult(connOrError.errorText)
       }
@@ -62,7 +62,10 @@ export function createRemoteWriteTool(
       await fs.writeFile(localPath, joinBom(content, bom), "utf-8")
 
       await conn.syncEngine.register(remotePath)
-      await conn.syncEngine.pushAll()
+      // Push ONLY this file. pushAll() here uploaded every tracked file from
+      // the local mirror, and for a new file the mirror had not been refreshed,
+      // so earlier files were overwritten with stale copies.
+      await conn.syncEngine.push([remotePath])
 
       return textResult(`Wrote file successfully.\nPath: ${remotePath}\nExists: ${existed}`)
     }
