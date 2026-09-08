@@ -72,6 +72,22 @@ export class ManifestManager {
             delete this.manifest.files[remotePath];
             this.dirty = true;
         }
+        if (this.manifest.pulled && remotePath in this.manifest.pulled) {
+            delete this.manifest.pulled[remotePath];
+            this.dirty = true;
+        }
+    }
+    /** Record the remote stamp observed when this file was last pulled or pushed. */
+    setPulled(remotePath, stamp) {
+        this.manifest.pulled ??= {};
+        if (this.manifest.pulled[remotePath] !== stamp) {
+            this.manifest.pulled[remotePath] = stamp;
+            this.dirty = true;
+        }
+    }
+    /** The remote stamp seen at last pull/push, or undefined if never observed. */
+    getPulled(remotePath) {
+        return this.manifest.pulled?.[remotePath];
     }
 }
 //# sourceMappingURL=manifest.js.map

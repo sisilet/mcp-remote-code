@@ -36,13 +36,18 @@ export function createRemoteWriteTool(
       const remotePath = jailed.path
 
       const localPath = conn.pathMapper.toLocal(remotePath)
-      const existed = await fs.stat(localPath).then((s) => s.isFile(), () => false)
+
+      // Decide "new vs overwrite" from the REMOTE, not the local mirror. The
+      // old check (fs.stat on the mirror) treated any file the tool had not
+      // seen before as new, skipped the pull, and overwrote it blind. Pulling
+      // the target first gives a correct diff preview and records the stamp
+      // the push guard needs.
+      await conn.syncEngine.register(remotePath)
+      const [existed] = await conn.syncEngine.pull([remotePath])
 
       let bom = false
       let oldContent = ""
       if (existed) {
-        await conn.syncEngine.register(remotePath)
-        await conn.syncEngine.pullAll()
         try {
           const existing = await readFileWithBom(fs, localPath)
           bom = existing.bom

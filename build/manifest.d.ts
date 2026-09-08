@@ -2,6 +2,13 @@ import type { PathMapper } from "./path-mapper.js";
 export interface Manifest {
     remote_root: string;
     files: Record<string, string>;
+    /**
+     * Remote stamp (mtime:size) of each tracked file as observed at its last
+     * pull. Consulted before a push: if the remote no longer matches, someone
+     * changed it outside this tool and a push would destroy their work.
+     * Optional so manifests written before this field existed still load.
+     */
+    pulled?: Record<string, string>;
 }
 export declare class ManifestManager {
     private manifest;
@@ -22,4 +29,8 @@ export declare class ManifestManager {
     getRel(remotePath: string): string | undefined;
     /** Remove a tracked path. */
     remove(remotePath: string): void;
+    /** Record the remote stamp observed when this file was last pulled or pushed. */
+    setPulled(remotePath: string, stamp: string): void;
+    /** The remote stamp seen at last pull/push, or undefined if never observed. */
+    getPulled(remotePath: string): string | undefined;
 }

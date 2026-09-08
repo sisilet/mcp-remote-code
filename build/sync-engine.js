@@ -26,11 +26,18 @@ export class SyncEngine {
     }
     /** Pull all tracked files from remote to local mirror */
     async pullAll() {
-        await this.withLock(async () => {
-            const files = this.manifest.remotePaths();
-            if (files.length === 0)
-                return;
-            await this.runSftp("pull", files);
+        await this.pull(this.manifest.remotePaths());
+    }
+    /**
+     * Pull the given files from remote to local mirror. Returns, per path,
+     * whether the file existed on the remote. A missing remote file leaves an
+     * empty local file (patches that add files rely on this).
+     */
+    async pull(remotePaths) {
+        return this.withLock(async () => {
+            if (remotePaths.length === 0)
+                return [];
+            return this.runSftp("pull", remotePaths);
         });
     }
     /**
@@ -43,6 +50,11 @@ export class SyncEngine {
      * pull and then overwrote every earlier file with a stale copy, silently
      * destroying any change made on the remote outside this tool (2026-09-08:
      * two scripts lost hours of edits this way).
+     *
+     * Guard: before each upload the remote is stat'ed and compared with the stamp
+     * recorded at the last pull. A mismatch means the remote changed underneath
+     * us; the push is refused with an error rather than overwriting. A remote
+     * file that exists but was never pulled is refused for the same reason.
      */
     async push(remotePaths) {
         await this.withLock(async () => {
@@ -68,6 +80,7 @@ export class SyncEngine {
         return rel;
     }
     async runSftp(direction, remotePaths) {
+        const existed = [];
         await this.sshPool.withSftp(async (sftp) => {
             for (const rp of remotePaths) {
                 const localPath = this.pathMapper.toLocal(rp);
@@ -76,6 +89,11 @@ export class SyncEngine {
                     await fs.mkdir(path.dirname(localPath), { recursive: true }).catch(() => { });
                     try {
                         await sftpFastGet(sftp, rp, localPath);
+                        // Remember what the remote looked like when we took this copy.
+                        const stamp = await remoteStamp(sftp, rp);
+                        if (stamp)
+                            this.manifest.setPulled(rp, stamp);
+                        existed.push(true);
                     }
                     catch (err) {
                         // If remote file does not exist, create an empty local file
@@ -83,6 +101,7 @@ export class SyncEngine {
                         const msg = err.message.toLowerCase();
                         if (msg.includes("no such file") || msg.includes("not found")) {
                             await fs.writeFile(localPath, "", "utf-8");
+                            existed.push(false);
                         }
                         else {
                             throw err;
@@ -90,14 +109,41 @@ export class SyncEngine {
                     }
                 }
                 else {
+                    // Refuse to overwrite a remote file that changed since we last saw it.
+                    const current = await remoteStamp(sftp, rp);
+                    const seen = this.manifest.getPulled(rp);
+                    if (current !== undefined && seen === undefined) {
+                        throw new Error(`Refusing to push ${rp}: the file exists on the remote but was never pulled into ` +
+                            `the local mirror, so its current contents are unknown. Read it first (remote_read), then retry.`);
+                    }
+                    if (current !== undefined && seen !== undefined && current !== seen) {
+                        throw new Error(`Refusing to push ${rp}: it changed on the remote since it was last pulled ` +
+                            `(remote mtime:size ${current}, last seen ${seen}). Something outside this tool ` +
+                            `edited it. Re-read the file, reapply your change, and retry.`);
+                    }
                     // Ensure remote parent dir exists
                     const remoteDir = path.posix.dirname(rp);
                     await this.sshPool.exec(`mkdir -p ${quoteShell(remoteDir)}`, { retry: true, timeout: 10_000 }).catch(() => { });
                     await sftpFastPut(sftp, localPath, rp);
+                    const after = await remoteStamp(sftp, rp);
+                    if (after)
+                        this.manifest.setPulled(rp, after);
                 }
             }
         });
+        await this.manifest.save();
+        return existed;
     }
+}
+/** "mtime:size" of a remote file, or undefined if it does not exist. */
+function remoteStamp(sftp, remotePath) {
+    return new Promise((resolve) => {
+        sftp.stat(remotePath, (err, stats) => {
+            if (err || !stats)
+                return resolve(undefined);
+            resolve(`${stats.mtime}:${stats.size}`);
+        });
+    });
 }
 function sftpFastGet(sftp, remotePath, localPath) {
     return new Promise((resolve, reject) => {

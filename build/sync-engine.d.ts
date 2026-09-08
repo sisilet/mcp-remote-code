@@ -12,6 +12,12 @@ export declare class SyncEngine {
     /** Pull all tracked files from remote to local mirror */
     pullAll(): Promise<void>;
     /**
+     * Pull the given files from remote to local mirror. Returns, per path,
+     * whether the file existed on the remote. A missing remote file leaves an
+     * empty local file (patches that add files rely on this).
+     */
+    pull(remotePaths: string[]): Promise<boolean[]>;
+    /**
      * Push only the given files from local mirror to remote.
      *
      * Tools must push exactly what they changed. pushAll() used to be called
@@ -21,6 +27,11 @@ export declare class SyncEngine {
      * pull and then overwrote every earlier file with a stale copy, silently
      * destroying any change made on the remote outside this tool (2026-09-08:
      * two scripts lost hours of edits this way).
+     *
+     * Guard: before each upload the remote is stat'ed and compared with the stamp
+     * recorded at the last pull. A mismatch means the remote changed underneath
+     * us; the push is refused with an error rather than overwriting. A remote
+     * file that exists but was never pulled is refused for the same reason.
      */
     push(remotePaths: string[]): Promise<void>;
     /**
