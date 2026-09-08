@@ -1,0 +1,9 @@
+Provenance: this diff includes unrelated work-in-progress that was already uncommitted in the same four files when the fix was staged (sftpFastPut atomic temp-then-rename upload and its F-12/F-27 review notes in sync-engine.ts; the F-39 real-delete path in remote-patch.ts). Those changes are the author's own and were landing anyway; they are not part of the fix.
+
+The fix itself is:
+  - SyncEngine.push(paths) (new)
+  - the three call sites switched from pushAll() to push([...]) in
+    remote-write.ts, remote-edit.ts, remote-patch.ts
+  - test/sync-engine.test.ts
+
+Diagnosed 2026-09-09 from mtimes on the remote (three untouched files rewritten in the same second) and the server's own [remote_write] log lines; see the follow-up commit 240e519 for the guard that turns the residual case into an error.
