@@ -12,8 +12,8 @@ describe("tool jail integration", () => {
   it("jailRemoteDir defaults to root", async () => {
     const pool = createFakeSSHPool({})
     const conn = await createTestConnection(pool, ROOT)
-    const result = jailRemoteDir(conn)
-    assert.equal(result.path, ROOT)
+    const result = await jailRemoteDir(conn)
+    assert.equal("path" in result ? result.path : undefined, ROOT)
   })
 
   it("jailRemotePath rejects outside paths before SSH file ops", async () => {
@@ -50,7 +50,7 @@ describe("tool jail integration", () => {
     manager.setConnectionForTest(connA)
     manager.setConnectionForTest(connB)
 
-    const result = requireConnection(manager)
-    assert.match("errorText" in result ? result.errorText : "", /Multiple targets configured/)
+    const result = await requireConnection(manager)
+    assert.match("errorText" in result ? result.errorText : "", /Multiple targets connected/)
   })
 })

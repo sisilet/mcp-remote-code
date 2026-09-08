@@ -1,6 +1,7 @@
 import assert from "node:assert/strict"
 import { describe, it } from "node:test"
 import {
+  buildRemoteConfig,
   loadTargetsFromEnv,
   parseStartupConnection,
   parseStartupConnections,
@@ -9,6 +10,42 @@ import {
 } from "../src/config.js"
 
 describe("config", () => {
+  it("parses structured host/user/port JSON targets", () => {
+    const targets = parseTargetsJson({
+      targets: [
+        {
+          name: "phone",
+          user: "root",
+          host: "192.168.0.10",
+          port: 8022,
+          key: "~/.ssh/phone",
+          path: "/mnt/android",
+          optional: true,
+        },
+      ],
+    })
+    assert.equal(targets[0].name, "phone")
+    assert.equal(targets[0].root, "/mnt/android")
+    assert.equal(targets[0].optional, true)
+    assert.match(targets[0].sshCommand, /ssh -i .+phone -p 8022 root@192\.168\.0\.10/)
+  })
+
+  it("parses local targets from JSON", () => {
+    const targets = parseTargetsJson({
+      targets: [
+        {
+          name: "mcp-remote-code",
+          type: "local",
+          path: "/Users/eric.f/projects/mcp-remote-code",
+        },
+      ],
+    })
+    assert.equal(targets[0].name, "mcp-remote-code")
+    assert.equal(targets[0].type, "local")
+    assert.equal(targets[0].root, "/Users/eric.f/projects/mcp-remote-code")
+    assert.equal(targets[0].sshCommand, "")
+  })
+
   it("parses --ssh --key --path", () => {
     const startup = parseStartupConnection([
       "--ssh",
@@ -187,5 +224,64 @@ describe("config", () => {
       if (prevRoot === undefined) delete process.env.REMOTE_ROOT
       else process.env.REMOTE_ROOT = prevRoot
     }
+  })
+})
+
+// D-C: no implicit user. A typo in the config must not silently connect as root.
+describe("mandatory user (D-C)", () => {
+  it("rejects a target without a user", () => {
+    assert.throws(
+      () => parseTargetsJson({ targets: [{ name: "box", host: "10.0.0.1", path: "/tmp" }] }),
+      /"user" is required/
+    )
+  })
+
+  it("accepts user@host in the host field", () => {
+    const [c] = parseTargetsJson({
+      targets: [{ name: "box", host: "alice@10.0.0.1", path: "/tmp" }],
+    })
+    assert.match(c.sshCommand, /alice@10\.0\.0\.1/)
+  })
+
+  it("accepts an explicit user field", () => {
+    const [c] = parseTargetsJson({
+      targets: [{ name: "box", user: "bob", host: "10.0.0.1", path: "/tmp" }],
+    })
+    assert.match(c.sshCommand, /bob@10\.0\.0\.1/)
+  })
+})
+
+// F-13: structured entries must not round-trip through an ssh string. Building
+// `ssh -i <path> user@host` and re-parsing loses any path containing a space.
+describe("structured config is canonical (F-13)", () => {
+  it("preserves a key path containing spaces", () => {
+    const [t] = parseTargetsJson({
+      targets: [{ name: "sp", user: "alice", host: "10.0.0.1", port: 2222,
+                  key: "/tmp/my keys/id_ed25519", path: "/srv" }],
+    })
+    const c = buildRemoteConfig(t.sshCommand, t.root, { connection: t.connection })
+    assert.equal(c.identity, "/tmp/my keys/id_ed25519")
+    assert.equal(c.host, "10.0.0.1")
+    assert.equal(c.user, "alice")
+    assert.equal(c.port, 2222)
+  })
+
+  it("still supports the ssh-string form", () => {
+    const [t] = parseTargetsJson({
+      targets: [{ name: "s2", ssh: "ssh -p 2200 bob@10.0.0.2", path: "/srv" }],
+    })
+    const c = buildRemoteConfig(t.sshCommand, t.root, { connection: t.connection })
+    assert.equal(c.user, "bob")
+    assert.equal(c.host, "10.0.0.2")
+    assert.equal(c.port, 2200)
+  })
+
+  it("keeps user@host in the host field working", () => {
+    const [t] = parseTargetsJson({
+      targets: [{ name: "s3", host: "carol@10.0.0.3", path: "/srv" }],
+    })
+    const c = buildRemoteConfig(t.sshCommand, t.root, { connection: t.connection })
+    assert.equal(c.user, "carol")
+    assert.equal(c.host, "10.0.0.3")
   })
 })

@@ -42,7 +42,7 @@ describe("remote_bash", () => {
       description: "read outside",
       outside: true,
     })
-    assert.match(first.content[0].text, /requires confirmation/)
+    assert.match(first.content[0].text, /paths outside the configured root/)
     assert.equal(pool.calls.length, 0)
 
     const second = await handleRemoteBash(manager, {

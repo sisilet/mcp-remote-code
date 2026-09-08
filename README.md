@@ -37,9 +37,70 @@ Global command:
 mcp-remote-code --remote "ssh user@host" --root /home/project
 ```
 
+## Connection model
+
+One SSH connection per target, with concurrency over channels (v3.0.0). SSH
+multiplexes channels by design; this is what OpenSSH's `ControlMaster` does. The
+previous 3+2 connection pool cost five handshakes and five remote `sshd`
+processes per target.
+
+Measured on a home LAN when this changed:
+
+| Target | Connect before | after |
+|---|---|---|
+| Linux server (gigabit) | 462 ms | 116 ms |
+| Synology DS220j (ARM, 512 MB) | 3597 ms | 400 ms |
+
+`REMOTE_MAX_CHANNELS` (default 6) caps concurrent channels; OpenSSH's
+`MaxSessions` defaults to 10 and counts SFTP sessions too, so the default leaves
+headroom. Exceeding it yields "Channel open failure", which is retried.
+
+The old `REMOTE_POOL_COMMAND_SIZE`, `REMOTE_POOL_FILE_SIZE` and
+`REMOTE_POOL_STAGGER_MS` no longer apply and log a deprecation warning if set.
+
+## Security model
+
+**Host key verification** (default). The offered host key must already appear in
+`~/.ssh/known_hosts`, matched with `ssh-keygen -F` so hashed entries and
+`[host]:port` forms work. An unknown host or a changed key aborts the connection
+with the fingerprint and the exact command to fix it. Per target:
+
+```json
+{ "name": "box", "host": "10.0.0.1", "hostKeyPolicy": "accept-new" }
+```
+
+- `verify` (default) — must be in known_hosts
+- `accept-new` — record on first use, then verify (trust-on-first-use)
+- `insecure` — accept anything, logs a warning. Equivalent to
+  `-o StrictHostKeyChecking=no`.
+
+**What the root jail does and does not cover.** The file tools (`remote_read`,
+`remote_write`, `remote_edit`, `remote_patch`, `remote_push`, `remote_pull`,
+`remote_stat`, `remote_hash`) resolve symlinks on the remote and refuse paths
+outside the configured root. **`remote_bash` is not sandboxed**: only its working
+directory is checked, and the command itself may reference any path the SSH user
+can reach.
+
+**Confirmation for commands outside the root.** When the MCP client supports
+elicitation, a command whose working directory falls outside the root prompts
+the *user*, and a decline refuses the command. When the client does not support
+it, or it is switched off, the `outside`/`force` flags fall back to a model-side
+acknowledgement — a speed bump, not an access control, since the model can
+simply call twice. The tool says which of the two applied. Switch it off with
+`MCP_ELICITATION=off`, or per target with `"elicitation": "off"`.
+
+**The local mirror is scratch, not a checkout.** File tools stage content in a
+local mirror directory. It is deleted and rebuilt whenever a target reconnects,
+and it carries no freshness tracking, so nothing should treat it as a durable
+copy of the remote tree.
+
+**Secrets.** `password` and `sudoPassword` are stored in plaintext in the targets
+file; the server warns on startup if that file is readable beyond the owner.
+Prefer key auth and passwordless `sudo` (NOPASSWD) over both.
+
 ## Cursor / Claude Desktop configuration
 
-Put all targets in `mcp.json` / `claude_desktop_config.json` so every agent shares the same config:
+Recommended: one shared targets file, referenced from mcp config:
 
 ```json
 {
@@ -48,28 +109,67 @@ Put all targets in `mcp.json` / `claude_desktop_config.json` so every agent shar
       "command": "node",
       "args": [
         "/path/to/mcp-remote-code/build/index.js",
-        "--ssh", "user@host",
-        "--key", "~/.ssh/id_rsa",
-        "--path", "/home/project",
-        "--name", "alpha",
-        "--ssh", "user@host2",
-        "--key", "~/.ssh/id_rsa",
-        "--path", "/home/projects",
-        "--name", "beta"
+        "--config",
+        "/Users/you/.mcp-remote-code/targets.json"
       ]
     }
   }
 }
 ```
 
-| Flag | Meaning |
-| --- | --- |
-| `--ssh` | `user@host` (repeat to add another target) |
-| `--key` | Identity file (`-i`) for the preceding `--ssh` |
-| `--path` | Remote jail root for the preceding `--ssh` |
-| `--name` | Optional target name |
+`~/.mcp-remote-code/targets.json` example:
 
-Aliases still supported: `--remote` (same as `--ssh`, also accepts `user@host:/path` shorthand), `--root` / `--workdir` (same as `--path`).
+```json
+{
+  "targets": [
+    {
+      "name": "alpha",
+      "user": "user",
+      "host": "host.example",
+      "key": "~/.ssh/id_rsa",
+      "path": "/home/project"
+    },
+    {
+      "name": "phone",
+      "user": "root",
+      "host": "192.168.0.10",
+      "port": 8022,
+      "key": "~/.ssh/phone",
+      "path": "/mnt/android",
+      "optional": true
+    },
+    {
+      "name": "workspace",
+      "type": "local",
+      "path": "/Users/you/projects/my-app"
+    }
+  ]
+}
+```
+
+| Field | Required | Meaning |
+| --- | --- | --- |
+| `name` | yes | Target id for tool calls |
+| `type` | no | `"local"` for a local directory; omit/`"ssh"` for remote |
+| `host` + `user` | yes* | SSH destination (`ssh` string also accepted) |
+| `path` | yes | Jail root (`root` / `workdir` aliases) |
+| `key` | no | Identity file |
+| `port` | no | SSH port (default 22) |
+| `optional` | no | Soft-fail if this host is offline |
+| `password` / `sudoPassword` | no | Auth secrets (prefer keys) |
+
+\*Or use `"ssh": "user@host"` / `"ssh": "ssh -p 8022 user@host"` instead of `user`/`host`/`port`.
+
+If `--config` is omitted and no CLI targets are given, the server loads `~/.mcp-remote-code/targets.json` automatically (legacy `~/.opencode/mcp-remote-code-targets.json` still works as fallback).
+
+Legacy interleaved CLI flags still work:
+
+```json
+"args": [
+  "/path/to/build/index.js",
+  "--ssh", "user@host", "--key", "~/.ssh/id_rsa", "--path", "/home/project", "--name", "alpha"
+]
+```
 
 Alternative: JSON env var:
 
@@ -93,43 +193,28 @@ Legacy single-target environment variables (still supported):
 ## CLI
 
 ```bash
-mcp-remote-code --ssh user@host --key ~/.ssh/id_rsa --path /home/project
+mcp-remote-code --config ~/.mcp-remote-code/targets.json
 ```
 
 | Flag | Meaning |
 | --- | --- |
-| `--ssh` | SSH target (repeat for multiple targets) |
+| `--config` | JSON targets file (recommended) |
+| `--ssh` | SSH target (legacy; repeat for multiple targets) |
 | `--key` | Identity file for the preceding `--ssh` |
 | `--path` | Root directory for the preceding `--ssh` |
 | `--remote` | Alias for `--ssh` |
 | `--root` | Alias for `--path` |
 | `--name` | Target name for the preceding `--ssh` |
-| `--config` | JSON file with a `targets` array |
 | `--workdir` | Alias for `--path` |
 | `--password` | SSH password |
 | `--sudo-password` | Sudo password |
 
 ### Targets config file
 
-Default path when no CLI targets are given:
+Default path:
 
 ```text
-~/.opencode/mcp-remote-code-targets.json
-```
-
-Example:
-
-```json
-{
-  "targets": [
-    {
-      "name": "dev",
-      "ssh": "user@host.example",
-      "key": "~/.ssh/id_rsa",
-      "path": "/home/project"
-    }
-  ]
-}
+~/.mcp-remote-code/targets.json
 ```
 
 When multiple targets are connected, pass `target` on every tool call.

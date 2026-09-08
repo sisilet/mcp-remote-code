@@ -1,6 +1,6 @@
 import { z } from "zod";
 import { quoteShell } from "../shell-quote.js";
-import { jailRemoteDir, requireConnection, targetSchema, textResult } from "../tool-utils.js";
+import { jailRemoteDir, keepUnderRoot, requireConnection, targetSchema, textResult } from "../tool-utils.js";
 export function createRemoteGlobTool(server, connectionManager) {
     server.registerTool("remote_glob", {
         description: `Find files matching a glob pattern on the remote machine within the configured root.`,
@@ -10,12 +10,12 @@ export function createRemoteGlobTool(server, connectionManager) {
             path: z.string().optional().describe("The directory to search in on the remote machine. Omit to use the configured root."),
         },
     }, async ({ target, pattern, path: searchDir }) => {
-        const connOrError = requireConnection(connectionManager, target);
+        const connOrError = await requireConnection(connectionManager, target);
         if ("errorText" in connOrError) {
             return textResult(connOrError.errorText);
         }
         const conn = connOrError;
-        const dirResult = jailRemoteDir(conn, searchDir);
+        const dirResult = await jailRemoteDir(conn, searchDir);
         if ("errorText" in dirResult) {
             return textResult(dirResult.errorText);
         }
@@ -23,7 +23,7 @@ export function createRemoteGlobTool(server, connectionManager) {
         const limit = 100;
         const escapedPattern = pattern.replace(/'/g, "'\"'\"'");
         const rgCmd = `cd ${quoteShell(actualDir)} && rg --files --sortr=modified --glob '${escapedPattern}' 2>/dev/null`;
-        let result = await conn.sshPool.exec(rgCmd, { timeout: 30_000 });
+        let result = await conn.sshPool.exec(rgCmd, { retry: true, timeout: 30_000 });
         let lines;
         if (result.stdout.trim()) {
             lines = result.stdout.split("\n").map((l) => l.trim()).filter(Boolean);
@@ -31,13 +31,16 @@ export function createRemoteGlobTool(server, connectionManager) {
         else {
             const namePredicate = buildFindNamePredicate(pattern);
             const findCmd = `cd ${quoteShell(actualDir)} && find . -maxdepth 10 ${namePredicate} -type f -exec stat -c '%Y %n' {} + 2>/dev/null | sort -rn | cut -d' ' -f2-`;
-            result = await conn.sshPool.exec(findCmd, { timeout: 30_000 });
+            result = await conn.sshPool.exec(findCmd, { retry: true, timeout: 30_000 });
             lines = result.stdout.split("\n").map((l) => l.trim()).filter(Boolean);
         }
         const seen = new Set();
         const files = [];
         for (const line of lines) {
             const full = line.startsWith("/") ? line : actualDir + "/" + line.replace(/^\.\//, "");
+            // A search rooted inside the jail can still return paths outside it.
+            if (keepUnderRoot(conn, [full]).length === 0)
+                continue;
             if (seen.has(full))
                 continue;
             seen.add(full);

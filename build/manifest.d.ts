@@ -8,6 +8,8 @@ export declare class ManifestManager {
     private path;
     private dirty;
     constructor(pathMapper: PathMapper);
+    /** Start from an empty manifest for a fresh connection (review F-21). */
+    reset(remoteRoot: string): void;
     load(): Promise<void>;
     save(): Promise<void>;
     /** Register a remote file path. Returns its local relative path. */

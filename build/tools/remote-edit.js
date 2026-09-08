@@ -403,7 +403,7 @@ export function createRemoteEditTool(server, connectionManager) {
         if (oldString === newString) {
             return textResult("No changes to apply: oldString and newString are identical.");
         }
-        const connOrError = requireConnection(connectionManager, target);
+        const connOrError = await requireConnection(connectionManager, target);
         if ("errorText" in connOrError) {
             return textResult(connOrError.errorText);
         }
@@ -440,7 +440,8 @@ export function createRemoteEditTool(server, connectionManager) {
             const next = splitBom(result);
             const desiredBom = bom || next.bom;
             await fs.writeFile(localPath, joinBom(result, desiredBom), "utf-8");
-            await conn.syncEngine.pushAll();
+            // Push only the edited file, never the whole mirror (see SyncEngine.push).
+            await conn.syncEngine.push([remotePath]);
             const stats = countDiffStats(content, result);
             return textResult(`Edit applied successfully.\nPath: ${remotePath}\nAdditions: ${stats.additions}\nDeletions: ${stats.deletions}`);
         });

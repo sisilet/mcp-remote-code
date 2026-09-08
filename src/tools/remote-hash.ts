@@ -18,7 +18,7 @@ export function createRemoteHashTool(
       },
     },
     async ({ target, path: inputPath }) => {
-      const connOrError = requireConnection(connectionManager, target)
+      const connOrError = await requireConnection(connectionManager, target)
       if ("errorText" in connOrError) {
         return textResult(connOrError.errorText)
       }
@@ -33,7 +33,7 @@ export function createRemoteHashTool(
 
       const typeResult = await conn.sshPool.exec(
         `if [ -f ${quoted} ]; then echo FILE; elif [ -d ${quoted} ]; then echo DIR; else echo MISSING; fi`,
-        { timeout: 10_000 }
+        { retry: true, timeout: 10_000 }
       )
       const remoteType = typeResult.stdout.trim()
       if (remoteType === "MISSING") {
@@ -45,7 +45,7 @@ export function createRemoteHashTool(
 
       const hashResult = await conn.sshPool.exec(
         `sha256sum ${quoted} 2>/dev/null | awk '{print $1}' || openssl dgst -sha256 ${quoted} | awk '{print $NF}'`,
-        { timeout: 120_000 }
+        { retry: true, timeout: 120_000 }
       )
       const hash = hashResult.stdout.trim().split("\n").find(Boolean)
       if (!hash) {

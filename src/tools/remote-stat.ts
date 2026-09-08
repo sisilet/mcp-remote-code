@@ -18,7 +18,7 @@ export function createRemoteStatTool(
       },
     },
     async ({ target, path: inputPath }) => {
-      const connOrError = requireConnection(connectionManager, target)
+      const connOrError = await requireConnection(connectionManager, target)
       if ("errorText" in connOrError) {
         return textResult(connOrError.errorText)
       }
@@ -31,18 +31,22 @@ export function createRemoteStatTool(
       const remotePath = jailed.path
       const quoted = quoteShell(remotePath)
 
+      // stat -c does not interpret backslash escapes, so a literal \t in the
+      // format string is emitted verbatim and the result never splits into
+      // fields (review F-23). Emit space-separated values from stat, then
+      // re-join with real tabs via printf, which does interpret \t.
       const command = `
 if [ -L ${quoted} ]; then
   printf 'symlink\\t%s\\n' "$(readlink ${quoted})"
 elif [ -f ${quoted} ]; then
-  stat -c 'file\\t%s\\t%Y\\t%W\\t%a' ${quoted}
+  printf 'file\\t%s\\t%s\\t%s\\t%s\\n' $(stat -c '%s %Y %W %a' ${quoted})
 elif [ -d ${quoted} ]; then
-  stat -c 'directory\\t%s\\t%Y\\t%W\\t%a' ${quoted}
+  printf 'directory\\t%s\\t%s\\t%s\\t%s\\n' $(stat -c '%s %Y %W %a' ${quoted})
 else
   printf 'missing\\t0\\t0\\t0\\t0\\n'
 fi
 `
-      const result = await conn.sshPool.exec(command, { timeout: 15_000 })
+      const result = await conn.sshPool.exec(command, { retry: true, timeout: 15_000 })
       const line = result.stdout.trim().split("\n").find(Boolean)
       if (!line) {
         return textResult(`remote_stat failed for ${remotePath}: ${result.stderr || "no output"}`)

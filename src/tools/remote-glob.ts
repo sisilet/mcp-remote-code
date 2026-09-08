@@ -2,7 +2,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js"
 import { z } from "zod"
 import type { ConnectionManager } from "../connection-manager.js"
 import { quoteShell } from "../shell-quote.js"
-import { jailRemoteDir, requireConnection, targetSchema, textResult } from "../tool-utils.js"
+import { jailRemoteDir, keepUnderRoot, requireConnection, targetSchema, textResult } from "../tool-utils.js"
 
 export function createRemoteGlobTool(
   server: McpServer,
@@ -19,13 +19,13 @@ export function createRemoteGlobTool(
       },
     },
     async ({ target, pattern, path: searchDir }) => {
-      const connOrError = requireConnection(connectionManager, target)
+      const connOrError = await requireConnection(connectionManager, target)
       if ("errorText" in connOrError) {
         return textResult(connOrError.errorText)
       }
       const conn = connOrError
 
-      const dirResult = jailRemoteDir(conn, searchDir)
+      const dirResult = await jailRemoteDir(conn, searchDir)
       if ("errorText" in dirResult) {
         return textResult(dirResult.errorText)
       }
@@ -34,7 +34,7 @@ export function createRemoteGlobTool(
 
       const escapedPattern = pattern.replace(/'/g, "'\"'\"'")
       const rgCmd = `cd ${quoteShell(actualDir)} && rg --files --sortr=modified --glob '${escapedPattern}' 2>/dev/null`
-      let result = await conn.sshPool.exec(rgCmd, { timeout: 30_000 })
+      let result = await conn.sshPool.exec(rgCmd, { retry: true, timeout: 30_000 })
 
       let lines: string[]
 
@@ -43,7 +43,7 @@ export function createRemoteGlobTool(
       } else {
         const namePredicate = buildFindNamePredicate(pattern)
         const findCmd = `cd ${quoteShell(actualDir)} && find . -maxdepth 10 ${namePredicate} -type f -exec stat -c '%Y %n' {} + 2>/dev/null | sort -rn | cut -d' ' -f2-`
-        result = await conn.sshPool.exec(findCmd, { timeout: 30_000 })
+        result = await conn.sshPool.exec(findCmd, { retry: true, timeout: 30_000 })
         lines = result.stdout.split("\n").map((l) => l.trim()).filter(Boolean)
       }
 
@@ -51,6 +51,8 @@ export function createRemoteGlobTool(
       const files: string[] = []
       for (const line of lines) {
         const full = line.startsWith("/") ? line : actualDir + "/" + line.replace(/^\.\//, "")
+        // A search rooted inside the jail can still return paths outside it.
+        if (keepUnderRoot(conn, [full]).length === 0) continue
         if (seen.has(full)) continue
         seen.add(full)
         files.push(full)

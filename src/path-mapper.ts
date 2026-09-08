@@ -1,4 +1,5 @@
 import path from "path"
+import { isUnderRoot } from "./root-jail.js"
 import type { RemoteConfig } from "./config.js"
 
 export class PathMapper {
@@ -28,7 +29,7 @@ export class PathMapper {
     }
 
     let relative: string
-    if (normalized === this.remoteRoot || normalized.startsWith(this.remoteRoot + "/")) {
+    if (this.isWithinWorkspace(normalized)) {
       relative = path.posix.relative(this.remoteRoot, normalized)
     } else {
       // Path outside remoteRoot: use full absolute path (strip leading /)
@@ -81,10 +82,16 @@ export class PathMapper {
     return "/" + posixRel
   }
 
-  /** Check whether a remote path is within the configured remote workdir */
+  /**
+   * Is a remote path within the configured remote workdir?
+   *
+   * Shares the root-jail prefix rule, including its handling of a root of
+   * "/" (review F-2, missed here: review F-45). Building `remoteRoot + "/"`
+   * yields "//" for that root, so every path looked external and every file
+   * was mirrored under its full absolute path.
+   */
   isWithinWorkspace(remotePath: string): boolean {
-    const normalized = path.posix.normalize(remotePath)
-    return normalized === this.remoteRoot || normalized.startsWith(this.remoteRoot + "/")
+    return isUnderRoot(this.remoteRoot, path.posix.normalize(remotePath))
   }
 
   /** Get the manifest file path for this mirror */

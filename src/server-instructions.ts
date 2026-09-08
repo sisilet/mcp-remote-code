@@ -1,28 +1,53 @@
-import type { ConnectionInfo } from "./connection-manager.js"
+import type { ConnectionInfo, FailedTarget } from "./connection-manager.js"
 
-export function buildServerInstructions(targets: ConnectionInfo[]): string {
+export function buildServerInstructions(
+  targets: ConnectionInfo[],
+  failed: FailedTarget[] = []
+): string {
   const rootList = targets.map((info) => `${info.name}=${info.workdir}`).join(", ")
+  const configuredCount = targets.length + failed.length
 
   const lines = [
-    "MCP Remote Code is connected to remote machine(s) over SSH.",
+    "MCP Remote Code is connected to local and/or remote targets.",
     "",
-    `Targets (${targets.length}):`,
+    `Connected targets (${targets.length}/${configuredCount}):`,
   ]
 
   for (const info of targets) {
+    if (info.transport === "local") {
+      lines.push(
+        `- ${info.name}: local, root=${info.workdir}, platform=${info.platform}, git=${info.isGitRepo ? "yes" : "no"}`
+      )
+    } else {
+      lines.push(
+        `- ${info.name}: ${info.user}@${info.host}:${info.port}, root=${info.workdir}, platform=${info.platform}, git=${info.isGitRepo ? "yes" : "no"}`
+      )
+    }
+  }
+
+  if (failed.length > 0) {
     lines.push(
-      `- ${info.name}: ${info.user}@${info.host}:${info.port}, root=${info.workdir}, platform=${info.platform}, git=${info.isGitRepo ? "yes" : "no"}`
+      "",
+      `Offline targets (${failed.length}) — tool calls with target=<name> auto-retry after a short cooldown:`
     )
+    for (const entry of failed) {
+      lines.push(`- ${entry.name}: ${entry.error}`)
+    }
   }
 
   if (targets.length > 1) {
-    lines.push("", "When multiple targets are configured, pass the target parameter on every tool call.")
+    lines.push("", "When multiple targets are connected, pass the target parameter on every tool call.")
+  } else if (targets.length === 1 && failed.length > 0) {
+    lines.push(
+      "",
+      `Only "${targets[0].name}" is online right now. You may omit target for that host. For offline targets, call a tool with target=<name> to trigger an automatic reconnect attempt (throttled).`
+    )
   }
 
   lines.push(
     "",
     "Agent policy — stay inside the configured root:",
-    `- Treat each target's root as the ONLY writable workspace: ${rootList}.`,
+    `- Treat each connected target's root as the ONLY writable workspace: ${rootList}.`,
     "- Do NOT use file tools to read, create, modify, delete, search, stat, hash, pull, or push paths outside that target's root.",
     "- Prefer paths relative to the root (e.g. src/main.ts) instead of absolute paths.",
     "- Do NOT attempt to bypass the jail with .., symlinks, or absolute paths outside the root. The server rejects these.",
@@ -45,7 +70,9 @@ export function buildServerInstructions(targets: ConnectionInfo[]): string {
     "- Default working directory is the target root.",
     "- Use bash only for builds, tests, package installs, and other commands that are not covered by file tools.",
     "- Do NOT use remote_bash to edit, create, or delete source files inside the project when file tools are available.",
-    "- Use outside=true and a two-step force confirmation only when the user explicitly needs commands outside the root.",
+    "- Use outside=true only when the user explicitly needs commands outside the root.",
+    "- Where the client supports elicitation, an outside command asks the user directly, and a decline is final: do not retry it with force.",
+    "- Where it does not, outside/force is a two-step model-side acknowledgement only. No human sees it, so treat it as your own commitment rather than as permission granted.",
     "- Commands are not parsed; bash is not command-sandboxed. Prefer file tools to enforce the root boundary."
   )
 

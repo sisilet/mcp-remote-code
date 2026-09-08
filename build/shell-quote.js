@@ -8,7 +8,9 @@
  *   in double quotes, and reopen: 'it'"'"'s' => it's
  */
 export function quoteShell(input) {
-    if (/^[a-zA-Z0-9_.\/\-]+$/.test(input)) {
+    // A leading "-" must never pass through: downstream commands would read it
+    // as an option rather than an operand (review F-15).
+    if (!input.startsWith("-") && /^[a-zA-Z0-9_.\/\-]+$/.test(input)) {
         return input;
     }
     return `'${input.replace(/'/g, "'\"'\"'")}'`;

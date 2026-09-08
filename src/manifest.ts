@@ -20,6 +20,11 @@ export class ManifestManager {
     }
   }
 
+  /** Start from an empty manifest for a fresh connection (review F-21). */
+  reset(remoteRoot: string): void {
+    ;(this as any).manifest = { remote_root: remoteRoot, files: {} }
+  }
+
   async load(): Promise<void> {
     try {
       const data = await fs.readFile(this.path, "utf-8")

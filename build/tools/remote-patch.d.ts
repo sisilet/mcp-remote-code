@@ -22,4 +22,28 @@ export interface UpdateFileChunk {
 export declare function parsePatch(patchText: string): {
     hunks: Hunk[];
 };
+interface HunkUnified {
+    oldStart: number;
+    oldCount: number;
+    newStart: number;
+    newCount: number;
+    lines: string[];
+}
+interface UnifiedDiffFile {
+    oldPath: string | null;
+    newPath: string | null;
+    hunks: HunkUnified[];
+    isNew: boolean;
+    isDeleted: boolean;
+}
+export declare function parseUnifiedPatch(patchText: string): UnifiedDiffFile[];
+export declare function detectNoNewlineAtEnd(hunks: HunkUnified[]): boolean;
+export declare function applyUnifiedDiff(content: string, hunks: HunkUnified[], hasNoNewlineMarker: boolean): string;
 export declare function createRemotePatchTool(server: McpServer, connectionManager: ConnectionManager): void;
+export declare function parseAndPrepareNative(patchText: string, remoteWorkdir: string, pathMapper: any): Promise<Array<{
+    path: string;
+    apply: (content: string) => string;
+    moveFrom?: string;
+    remove?: boolean;
+}>>;
+export {};

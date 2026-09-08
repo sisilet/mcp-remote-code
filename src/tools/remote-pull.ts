@@ -5,6 +5,7 @@ import { z } from "zod"
 import type { ConnectionManager } from "../connection-manager.js"
 import { checkConfirmation } from "../confirmation.js"
 import { quoteShell } from "../shell-quote.js"
+import { pullDirectoryViaTar, remoteHasTar, shouldUseBulk } from "../bulk-transfer.js"
 import { jailRemotePath, requireConnection, targetSchema, textResult } from "../tool-utils.js"
 
 const DEFAULT_WARN_BYTES = 25 * 1024 * 1024
@@ -43,7 +44,7 @@ export function createRemotePullTool(
       },
     },
     async ({ target, remotePath: remotePathArg, localPath: localPathArg, force }) => {
-      const connOrError = requireConnection(connectionManager, target)
+      const connOrError = await requireConnection(connectionManager, target)
       if ("errorText" in connOrError) {
         return textResult(connOrError.errorText)
       }
@@ -112,7 +113,7 @@ export function createRemotePullTool(
         await pullDirectory(conn.sshPool, plan.remotePath, plan.localPath)
       }
 
-      return textResult(["Pulled remote ${plan.type} successfully.", "", renderPlan(plan)].join("\n"))
+      return textResult([`Pulled remote ${plan.type} successfully.`, "", renderPlan(plan)].join("\n"))
     }
   )
 }
@@ -162,7 +163,7 @@ else
   printf 'MISSING\\t0\\t0\\t0\\n'
 fi
 `
-  const result = await sshPool.exec(command, { timeout: REMOTE_FIND_TIMEOUT_MS })
+  const result = await sshPool.exec(command, { retry: true, timeout: REMOTE_FIND_TIMEOUT_MS })
   const line = result.stdout.trim().split("\n").find(Boolean)
   if (!line) {
     throw new Error(`remote_pull failed to stat ${remotePath}: ${result.stderr || "no output"}`)
@@ -206,6 +207,18 @@ async function pullDirectory(sshPool: any, remotePath: string, localPath: string
   ])
 
   await fs.mkdir(localPath, { recursive: true })
+
+  // Fast path: one tar stream instead of a round trip per file (D-D).
+  // Falls back to per-file SFTP on any failure, so a remote without a usable
+  // tar, or an odd filesystem, still works.
+  if (shouldUseBulk(files.length) && (await remoteHasTar(sshPool))) {
+    const result = await pullDirectoryViaTar(sshPool, remotePath, localPath)
+    if (result.ok) return
+    console.error(
+      `[remote_pull] bulk transfer failed (${result.error}); falling back to per-file copy`
+    )
+  }
+
   for (const dir of dirs) {
     await fs.mkdir(localChildPath(remotePath, dir, localPath), { recursive: true })
   }
@@ -226,7 +239,7 @@ async function listRemotePaths(
 ): Promise<string[]> {
   const result = await sshPool.exec(
     `find ${quoteShell(remotePath)} -type ${type} -print0`,
-    { timeout: REMOTE_FIND_TIMEOUT_MS }
+    { retry: true, timeout: REMOTE_FIND_TIMEOUT_MS }
   )
   return result.stdout.split("\0").filter(Boolean)
 }

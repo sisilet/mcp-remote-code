@@ -21,6 +21,7 @@ export async function createTestConnection(
 
   return {
     name: "test",
+    transport: "ssh",
     config,
     sshPool,
     pathMapper,

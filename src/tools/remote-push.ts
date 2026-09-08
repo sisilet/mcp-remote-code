@@ -5,6 +5,11 @@ import { z } from "zod"
 import type { ConnectionManager } from "../connection-manager.js"
 import { checkConfirmation } from "../confirmation.js"
 import { quoteShell } from "../shell-quote.js"
+// The same atomic put the sync engine uses. Push previously had its own plain
+// fastPut (review F-29, and F-12 left incomplete for push): it wrote through a
+// symlinked destination instead of replacing it, and truncated the target if
+// the transfer failed partway.
+import { sftpFastPut } from "../sync-engine.js"
 import { jailRemotePath, requireConnection, targetSchema, textResult } from "../tool-utils.js"
 
 const DEFAULT_WARN_BYTES = 25 * 1024 * 1024
@@ -48,7 +53,7 @@ export function createRemotePushTool(
       },
     },
     async ({ target, localPath: localPathArg, remotePath: remotePathArg, force }) => {
-      const connOrError = requireConnection(connectionManager, target)
+      const connOrError = await requireConnection(connectionManager, target)
       if ("errorText" in connOrError) {
         return textResult(connOrError.errorText)
       }
@@ -121,7 +126,7 @@ export function createRemotePushTool(
         await pushDirectory(conn.sshPool, plan.localPath, plan.remotePath)
       }
 
-      return textResult(["Pushed local ${plan.type} successfully.", "", renderPlan(plan)].join("\n"))
+      return textResult([`Pushed local ${plan.type} successfully.`, "", renderPlan(plan)].join("\n"))
     }
   )
 }
@@ -221,7 +226,7 @@ async function scanLocalDirectory(localPath: string): Promise<LocalTree> {
 
 async function pushFile(sshPool: any, localPath: string, remotePath: string): Promise<void> {
   const remoteDir = path.posix.dirname(remotePath)
-  await sshPool.exec(`mkdir -p ${quoteShell(remoteDir)}`, { timeout: 10_000 })
+  await sshPool.exec(`mkdir -p ${quoteShell(remoteDir)}`, { retry: true, timeout: 10_000 })
   await sshPool.withSftp(async (sftp: any) => {
     await sftpFastPut(sftp, localPath, remotePath)
   })
@@ -232,7 +237,7 @@ async function pushDirectory(sshPool: any, localPath: string, remotePath: string
 
   for (const dir of tree.directories) {
     const target = remoteChildPath(localPath, dir, remotePath)
-    await sshPool.exec(`mkdir -p ${quoteShell(target)}`, { timeout: 10_000 })
+    await sshPool.exec(`mkdir -p ${quoteShell(target)}`, { retry: true, timeout: 10_000 })
   }
 
   await sshPool.withSftp(async (sftp: any) => {
@@ -260,19 +265,6 @@ function remoteChildPath(localBase: string, localChild: string, remoteBase: stri
   }
 
   return path.posix.join(remoteBase, ...segments)
-}
-
-function sftpFastPut(
-  sftp: any,
-  localPath: string,
-  remotePath: string
-): Promise<void> {
-  return new Promise((resolve, reject) => {
-    sftp.fastPut(localPath, remotePath, (err: Error | undefined) => {
-      if (err) reject(err)
-      else resolve()
-    })
-  })
 }
 
 function parsePositiveInt(value: string | undefined, fallback: number): number {

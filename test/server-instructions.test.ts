@@ -51,7 +51,29 @@ describe("server instructions", () => {
         connected: true,
       },
     ])
-    assert.match(text, /Targets \(2\)/)
+    assert.match(text, /Connected targets \(2\/2\)/)
     assert.match(text, /target parameter/)
+  })
+
+  it("lists offline targets without blocking online ones", () => {
+    const text = buildServerInstructions(
+      [
+        {
+          name: "genie",
+          host: "a",
+          user: "u",
+          port: 22,
+          workdir: "/a",
+          platform: "linux",
+          isGitRepo: false,
+          connected: true,
+        },
+      ],
+      [{ name: "galaxy-s26", error: "connect ECONNREFUSED" }]
+    )
+    assert.match(text, /Connected targets \(1\/2\)/)
+    assert.match(text, /Offline targets \(1\)/)
+    assert.match(text, /galaxy-s26: connect ECONNREFUSED/)
+    assert.match(text, /auto-retry|automatic reconnect|throttled/i)
   })
 })

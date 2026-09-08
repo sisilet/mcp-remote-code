@@ -11,6 +11,11 @@ export class ManifestManager {
             files: {},
         };
     }
+    /** Start from an empty manifest for a fresh connection (review F-21). */
+    reset(remoteRoot) {
+        ;
+        this.manifest = { remote_root: remoteRoot, files: {} };
+    }
     async load() {
         try {
             const data = await fs.readFile(this.path, "utf-8");

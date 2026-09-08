@@ -1,6 +1,7 @@
 import fs from "fs/promises";
 import path from "path";
 import { z } from "zod";
+import { quoteShell } from "../shell-quote.js";
 import { jailRemotePath, requireConnection, targetSchema, textResult } from "../tool-utils.js";
 const DEFAULT_LIMIT = 2000;
 const MAX_BYTES = 50 * 1024;
@@ -22,12 +23,12 @@ async function checkRemoteBinary(sshPool, remotePath) {
     if (isBinaryByExtension(remotePath)) {
         return { isBinary: true, reason: "binary extension" };
     }
-    const fileResult = await sshPool.exec(`file -b ${quoteShell(remotePath)} 2>/dev/null || echo "UNKNOWN"`, { timeout: 10_000 });
+    const fileResult = await sshPool.exec(`file -b ${quoteShell(remotePath)} 2>/dev/null || echo "UNKNOWN"`, { retry: true, timeout: 10_000 });
     const fileDesc = fileResult.stdout.trim().toLowerCase();
     if (fileDesc !== "unknown" && !fileDesc.includes("text") && !fileDesc.includes("empty")) {
         return { isBinary: true, reason: `file type: ${fileResult.stdout.trim()}` };
     }
-    const nullCheck = await sshPool.exec(`dd bs=4096 count=1 if=${quoteShell(remotePath)} 2>/dev/null | od -An -tx1 | grep -q ' 00 ' && echo HAS_NULL || echo NO_NULL`, { timeout: 10_000 });
+    const nullCheck = await sshPool.exec(`dd bs=4096 count=1 if=${quoteShell(remotePath)} 2>/dev/null | od -An -tx1 | grep -q ' 00 ' && echo HAS_NULL || echo NO_NULL`, { retry: true, timeout: 10_000 });
     if (nullCheck.stdout.trim() === "HAS_NULL") {
         return { isBinary: true, reason: "null bytes detected" };
     }
@@ -43,7 +44,7 @@ export function createRemoteReadTool(server, connectionManager) {
             limit: z.number().optional().describe("The maximum number of lines to read (defaults to 2000)"),
         },
     }, async ({ target, filePath, offset: offsetArg, limit: limitArg }) => {
-        const connOrError = requireConnection(connectionManager, target);
+        const connOrError = await requireConnection(connectionManager, target);
         if ("errorText" in connOrError) {
             return textResult(connOrError.errorText);
         }
@@ -56,10 +57,10 @@ export function createRemoteReadTool(server, connectionManager) {
         const localPath = conn.pathMapper.toLocal(remotePath);
         const limit = limitArg ?? DEFAULT_LIMIT;
         const offset = (offsetArg ?? 1) - 1;
-        const typeResult = await conn.sshPool.exec(`if [ -d ${quoteShell(remotePath)} ]; then echo "DIR"; elif [ -f ${quoteShell(remotePath)} ]; then echo "FILE"; else echo "MISSING"; fi`, { timeout: 10_000 });
+        const typeResult = await conn.sshPool.exec(`if [ -d ${quoteShell(remotePath)} ]; then echo "DIR"; elif [ -f ${quoteShell(remotePath)} ]; then echo "FILE"; else echo "MISSING"; fi`, { retry: true, timeout: 10_000 });
         const remoteType = typeResult.stdout.trim();
         if (remoteType === "DIR") {
-            const result = await conn.sshPool.exec(`ls -1pA ${quoteShell(remotePath)}`, { timeout: 15_000 });
+            const result = await conn.sshPool.exec(`ls -1pA ${quoteShell(remotePath)}`, { retry: true, timeout: 15_000 });
             const items = result.stdout
                 .split("\n")
                 .map((l) => l.trim())
@@ -87,7 +88,7 @@ export function createRemoteReadTool(server, connectionManager) {
             const base = path.posix.basename(remotePath).toLowerCase();
             let suggestions = [];
             try {
-                const result = await conn.sshPool.exec(`ls -1A ${quoteShell(remoteDir)}`, { timeout: 10_000 });
+                const result = await conn.sshPool.exec(`ls -1A ${quoteShell(remoteDir)}`, { retry: true, timeout: 10_000 });
                 const items = result.stdout.split("\n").map((l) => l.trim()).filter(Boolean);
                 suggestions = items
                     .filter((i) => i.toLowerCase().includes(base) || base.includes(i.toLowerCase()))
@@ -179,10 +180,5 @@ export function createRemoteReadTool(server, connectionManager) {
             content: [{ type: "text", text: output }],
         };
     });
-}
-function quoteShell(input) {
-    if (/^[a-zA-Z0-9_.\/\-]+$/.test(input))
-        return input;
-    return `"${input.replace(/"/g, '\\"')}"`;
 }
 //# sourceMappingURL=remote-read.js.map

@@ -1,6 +1,6 @@
 {
   "name": "mcp-remote-code",
-  "version": "2.1.0",
+  "version": "3.2.0",
   "description": "Stdio MCP server for remote machine control over SSH with a jailed root directory",
   "type": "module",
   "main": "build/index.js",
@@ -19,9 +19,11 @@
     "build": "tsc",
     "postbuild": "node scripts/postbuild.mjs",
     "dev": "tsc --watch",
-    "lint": "tsc --noEmit",
+    "lint": "tsc --noEmit && npm run lint:stdout",
     "test": "node --import tsx --test test/*.test.ts test/tools/*.test.ts",
-    "test:docker": "node --import tsx --test test/docker/*.test.ts"
+    "test:docker": "npm run test:docker:down --silent; node --import tsx --test --test-concurrency=1 test/docker/*.test.ts; rc=$?; npm run test:docker:down --silent; exit $rc",
+    "test:docker:down": "docker compose -f test/docker/compose.yml down -v >/dev/null 2>&1 || true",
+    "lint:stdout": "! grep -rn 'console\\.log' src/ --include=*.ts | grep -v 'index.ts'"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.29.0",

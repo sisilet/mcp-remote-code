@@ -1,5 +1,6 @@
 import { z } from "zod";
 import { quoteShell } from "../shell-quote.js";
+import { isUnderRoot } from "../root-jail.js";
 import { jailRemoteDir, requireConnection, targetSchema, textResult } from "../tool-utils.js";
 export function createRemoteGrepTool(server, connectionManager) {
     server.registerTool("remote_grep", {
@@ -11,12 +12,12 @@ export function createRemoteGrepTool(server, connectionManager) {
             include: z.string().optional().describe("File pattern to include in the search (e.g. '*.js', '*.{ts,tsx}')"),
         },
     }, async ({ target, pattern, path: searchDir, include }) => {
-        const connOrError = requireConnection(connectionManager, target);
+        const connOrError = await requireConnection(connectionManager, target);
         if ("errorText" in connOrError) {
             return textResult(connOrError.errorText);
         }
         const conn = connOrError;
-        const dirResult = jailRemoteDir(conn, searchDir);
+        const dirResult = await jailRemoteDir(conn, searchDir);
         if ("errorText" in dirResult) {
             return textResult(dirResult.errorText);
         }
@@ -31,7 +32,7 @@ export function createRemoteGrepTool(server, connectionManager) {
         else {
             cmd = `cd ${quoteShell(actualDir)} && rg --json --sortr=modified -n -- '${escapedPattern}' 2>/dev/null`;
         }
-        let result = await conn.sshPool.exec(cmd, { timeout: 30_000 });
+        let result = await conn.sshPool.exec(cmd, { retry: true, timeout: 30_000 });
         if (!result.stdout.trim()) {
             if (include) {
                 const glob = include.replace(/'/g, "'\"'\"'");
@@ -40,13 +41,13 @@ export function createRemoteGrepTool(server, connectionManager) {
             else {
                 cmd = `cd ${quoteShell(actualDir)} && grep -Ern -- '${escapedPattern}' . 2>/dev/null`;
             }
-            result = await conn.sshPool.exec(cmd, { timeout: 30_000 });
-            return parseGrepOutput(result.stdout, actualDir, pattern, limit);
+            result = await conn.sshPool.exec(cmd, { retry: true, timeout: 30_000 });
+            return parseGrepOutput(result.stdout, actualDir, pattern, limit, conn.config.remoteWorkdir);
         }
-        return parseRgJsonOutput(result.stdout, actualDir, pattern, limit);
+        return parseRgJsonOutput(result.stdout, actualDir, pattern, limit, conn.config.remoteWorkdir);
     });
 }
-function parseRgJsonOutput(stdout, searchDir, pattern, limit) {
+function parseRgJsonOutput(stdout, searchDir, pattern, limit, root) {
     const lines = stdout.split("\n").filter(Boolean);
     const matches = [];
     for (const line of lines) {
@@ -56,6 +57,9 @@ function parseRgJsonOutput(stdout, searchDir, pattern, limit) {
                 const m = msg;
                 const rawPath = m.data.path.text;
                 const fullPath = rawPath.startsWith("/") ? rawPath : searchDir + "/" + rawPath;
+                // A search rooted inside the jail can still match paths outside it.
+                if (!isUnderRoot(root, fullPath))
+                    continue;
                 matches.push({
                     path: fullPath,
                     line: m.data.line_number,
@@ -69,7 +73,7 @@ function parseRgJsonOutput(stdout, searchDir, pattern, limit) {
     }
     return formatGrepResult(matches, pattern, limit);
 }
-function parseGrepOutput(stdout, searchDir, pattern, limit) {
+function parseGrepOutput(stdout, searchDir, pattern, limit, root) {
     const lines = stdout.split("\n").filter(Boolean);
     const matches = [];
     for (const line of lines) {
@@ -87,6 +91,9 @@ function parseGrepOutput(stdout, searchDir, pattern, limit) {
         if (rawPath.startsWith("./"))
             rawPath = rawPath.slice(2);
         const fullPath = rawPath.startsWith("/") ? rawPath : searchDir + "/" + rawPath;
+        // A search rooted inside the jail can still match paths outside it.
+        if (!isUnderRoot(root, fullPath))
+            continue;
         matches.push({ path: fullPath, line: lineNum, text });
     }
     return formatGrepResult(matches, pattern, limit);

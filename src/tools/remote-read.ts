@@ -3,6 +3,7 @@ import path from "path"
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js"
 import { z } from "zod"
 import type { ConnectionManager } from "../connection-manager.js"
+import { quoteShell } from "../shell-quote.js"
 import { jailRemotePath, requireConnection, targetSchema, textResult } from "../tool-utils.js"
 
 const DEFAULT_LIMIT = 2000
@@ -34,7 +35,7 @@ async function checkRemoteBinary(
 
   const fileResult = await sshPool.exec(
     `file -b ${quoteShell(remotePath)} 2>/dev/null || echo "UNKNOWN"`,
-    { timeout: 10_000 }
+    { retry: true, timeout: 10_000 }
   )
   const fileDesc = fileResult.stdout.trim().toLowerCase()
   if (fileDesc !== "unknown" && !fileDesc.includes("text") && !fileDesc.includes("empty")) {
@@ -43,7 +44,7 @@ async function checkRemoteBinary(
 
   const nullCheck = await sshPool.exec(
     `dd bs=4096 count=1 if=${quoteShell(remotePath)} 2>/dev/null | od -An -tx1 | grep -q ' 00 ' && echo HAS_NULL || echo NO_NULL`,
-    { timeout: 10_000 }
+    { retry: true, timeout: 10_000 }
   )
   if (nullCheck.stdout.trim() === "HAS_NULL") {
     return { isBinary: true, reason: "null bytes detected" }
@@ -68,7 +69,7 @@ export function createRemoteReadTool(
       },
     },
     async ({ target, filePath, offset: offsetArg, limit: limitArg }) => {
-      const connOrError = requireConnection(connectionManager, target)
+      const connOrError = await requireConnection(connectionManager, target)
       if ("errorText" in connOrError) {
         return textResult(connOrError.errorText)
       }
@@ -86,14 +87,14 @@ export function createRemoteReadTool(
 
       const typeResult = await conn.sshPool.exec(
         `if [ -d ${quoteShell(remotePath)} ]; then echo "DIR"; elif [ -f ${quoteShell(remotePath)} ]; then echo "FILE"; else echo "MISSING"; fi`,
-        { timeout: 10_000 }
+        { retry: true, timeout: 10_000 }
       )
       const remoteType = typeResult.stdout.trim()
 
       if (remoteType === "DIR") {
         const result = await conn.sshPool.exec(
           `ls -1pA ${quoteShell(remotePath)}`,
-          { timeout: 15_000 }
+          { retry: true, timeout: 15_000 }
         )
         const items = result.stdout
           .split("\n")
@@ -125,7 +126,7 @@ export function createRemoteReadTool(
         const base = path.posix.basename(remotePath).toLowerCase()
         let suggestions: string[] = []
         try {
-          const result = await conn.sshPool.exec(`ls -1A ${quoteShell(remoteDir)}`, { timeout: 10_000 })
+          const result = await conn.sshPool.exec(`ls -1A ${quoteShell(remoteDir)}`, { retry: true, timeout: 10_000 })
           const items = result.stdout.split("\n").map((l) => l.trim()).filter(Boolean)
           suggestions = items
             .filter((i) => i.toLowerCase().includes(base) || base.includes(i.toLowerCase()))
@@ -223,9 +224,4 @@ export function createRemoteReadTool(
       }
     }
   )
-}
-
-function quoteShell(input: string): string {
-  if (/^[a-zA-Z0-9_.\/\-]+$/.test(input)) return input
-  return `"${input.replace(/"/g, '\\"')}"`
 }

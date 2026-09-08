@@ -3,6 +3,7 @@ import path from "path";
 import { z } from "zod";
 import { checkConfirmation } from "../confirmation.js";
 import { quoteShell } from "../shell-quote.js";
+import { pullDirectoryViaTar, remoteHasTar, shouldUseBulk } from "../bulk-transfer.js";
 import { jailRemotePath, requireConnection, targetSchema, textResult } from "../tool-utils.js";
 const DEFAULT_WARN_BYTES = 25 * 1024 * 1024;
 const DEFAULT_WARN_FILES = 500;
@@ -17,7 +18,7 @@ export function createRemotePullTool(server, connectionManager) {
             force: z.boolean().optional().describe("Set true only after a large-transfer warning to confirm the download."),
         },
     }, async ({ target, remotePath: remotePathArg, localPath: localPathArg, force }) => {
-        const connOrError = requireConnection(connectionManager, target);
+        const connOrError = await requireConnection(connectionManager, target);
         if ("errorText" in connOrError) {
             return textResult(connOrError.errorText);
         }
@@ -70,7 +71,7 @@ export function createRemotePullTool(server, connectionManager) {
         else {
             await pullDirectory(conn.sshPool, plan.remotePath, plan.localPath);
         }
-        return textResult(["Pulled remote ${plan.type} successfully.", "", renderPlan(plan)].join("\n"));
+        return textResult([`Pulled remote ${plan.type} successfully.`, "", renderPlan(plan)].join("\n"));
     });
 }
 function buildConfirmationKey(plan) {
@@ -113,7 +114,7 @@ else
   printf 'MISSING\\t0\\t0\\t0\\n'
 fi
 `;
-    const result = await sshPool.exec(command, { timeout: REMOTE_FIND_TIMEOUT_MS });
+    const result = await sshPool.exec(command, { retry: true, timeout: REMOTE_FIND_TIMEOUT_MS });
     const line = result.stdout.trim().split("\n").find(Boolean);
     if (!line) {
         throw new Error(`remote_pull failed to stat ${remotePath}: ${result.stderr || "no output"}`);
@@ -152,6 +153,15 @@ async function pullDirectory(sshPool, remotePath, localPath) {
         listRemotePaths(sshPool, remotePath, "f"),
     ]);
     await fs.mkdir(localPath, { recursive: true });
+    // Fast path: one tar stream instead of a round trip per file (D-D).
+    // Falls back to per-file SFTP on any failure, so a remote without a usable
+    // tar, or an odd filesystem, still works.
+    if (shouldUseBulk(files.length) && (await remoteHasTar(sshPool))) {
+        const result = await pullDirectoryViaTar(sshPool, remotePath, localPath);
+        if (result.ok)
+            return;
+        console.error(`[remote_pull] bulk transfer failed (${result.error}); falling back to per-file copy`);
+    }
     for (const dir of dirs) {
         await fs.mkdir(localChildPath(remotePath, dir, localPath), { recursive: true });
     }
@@ -164,7 +174,7 @@ async function pullDirectory(sshPool, remotePath, localPath) {
     });
 }
 async function listRemotePaths(sshPool, remotePath, type) {
-    const result = await sshPool.exec(`find ${quoteShell(remotePath)} -type ${type} -print0`, { timeout: REMOTE_FIND_TIMEOUT_MS });
+    const result = await sshPool.exec(`find ${quoteShell(remotePath)} -type ${type} -print0`, { retry: true, timeout: REMOTE_FIND_TIMEOUT_MS });
     return result.stdout.split("\0").filter(Boolean);
 }
 function localChildPath(remoteBase, remoteChild, localBase) {
